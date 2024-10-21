@@ -1,0 +1,13 @@
+[package]
+name = "streameroo"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+fluvio = "0.23.3"
+fnv = "1.0.7"
+fxhash = "0.2.1"
+lapin = "2.5.0"
+ouroboros = "0.18.4"
+serde = { version = "1.0.210", features = ["derive"] }
+tokio = { version = "1.40.0", features = ["full", "rt"] }
