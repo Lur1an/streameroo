@@ -1,16 +1,20 @@
+pub use lapin;
+
+use fnv::FnvHashMap;
+use lapin::{BasicProperties, Channel};
 use std::any::{Any, TypeId};
 use std::convert::Infallible;
 use std::future::Future;
 use std::ops::Deref;
 use std::sync::Arc;
 
-use fnv::FnvHashMap;
 use lapin::acker::Acker;
 use lapin::message::Delivery;
 use lapin::types::{DeliveryTag, ShortString};
-use lapin::{BasicProperties, Channel};
 
 use crate::event::{Decode, Encode, Event};
+
+pub trait AMQPEvent: Event {}
 
 pub struct Context {
     /// The global lapin channel to interact with the broker
@@ -21,9 +25,38 @@ pub struct Context {
 
 pub struct Publish<E>(E);
 
+pub struct Exchange(ShortString);
+
 pub struct ReplyTo<E>(E)
 where
     E: Encode;
+
+#[derive(Clone)]
+pub struct Streameroo {
+    context: Arc<Context>,
+}
+
+impl Streameroo {
+    pub fn new(channel: Channel) -> Self {
+        let context = Context {
+            channel,
+            data: FnvHashMap::default(),
+        };
+        Self {
+            context: Arc::new(context),
+        }
+    }
+
+    pub async fn spawn_handler<P, R>(&self, handler: impl AMQPHandler<P, R>)
+    where
+        P: Send,
+        R: Send,
+    {
+        let c: Arc<Context> = todo!();
+        let d: Delivery = todo!();
+        tokio::spawn(handler.call(d, c));
+    }
+}
 
 impl Context {
     pub fn insert<D: Any + Send + Sync>(&mut self, data: D) {
@@ -40,6 +73,18 @@ impl Context {
             .get(&TypeId::of::<D>())
             .and_then(|x| x.downcast_ref::<D>())
     }
+}
+
+/// The context of a Delivery. All values derivable from the derivable and global context can be accessed here.
+pub struct DeliveryContext {
+    /// Reference to the global context
+    global: Arc<Context>,
+    delivery_tag: DeliveryTag,
+    exchange: ShortString,
+    routing_key: ShortString,
+    redelivered: bool,
+    properties: BasicProperties,
+    acker: Acker,
 }
 
 pub struct State<T: 'static>(&'static T);
@@ -88,35 +133,20 @@ impl FromDeliveryContext for Channel {
 pub trait FromDeliveryContext {
     fn from_delivery_context(context: &DeliveryContext) -> Self;
 }
-
-/// The context of a Delivery. All values derivable from the derivable and global context can be accessed here.
-pub struct DeliveryContext {
-    /// Reference to the global context
-    global: Arc<Context>,
-    delivery_tag: Option<DeliveryTag>,
-    exchange: Option<ShortString>,
-    routing_key: Option<ShortString>,
-    redelivered: Option<bool>,
-    properties: Option<BasicProperties>,
-    acker: Option<Acker>,
-}
-
 fn create_handler_context(delivery: Delivery, context: Arc<Context>) -> (DeliveryContext, Vec<u8>) {
     (
         DeliveryContext {
             global: context,
-            delivery_tag: Some(delivery.delivery_tag),
-            exchange: Some(delivery.exchange),
-            routing_key: Some(delivery.routing_key),
-            redelivered: Some(delivery.redelivered),
-            properties: Some(delivery.properties),
-            acker: Some(delivery.acker),
+            delivery_tag: delivery.delivery_tag,
+            exchange: delivery.exchange,
+            routing_key: delivery.routing_key,
+            redelivered: delivery.redelivered,
+            properties: delivery.properties,
+            acker: delivery.acker,
         },
         delivery.data,
     )
 }
-
-pub trait AMQPEvent: Event {}
 
 impl<T1, E, F, Fut> AMQPHandler<(T1, E), ()> for F
 where
@@ -170,8 +200,8 @@ struct TestEvent;
 impl Decode for TestEvent {
     type Error = Infallible;
 
-    fn decode(data: &[u8]) -> Result<Self, Self::Error> {
-        todo!()
+    fn decode(data: &[u8]) -> Result<Self, Infallible> {
+        Ok(todo!())
     }
 }
 
