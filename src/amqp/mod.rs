@@ -1,9 +1,10 @@
 pub use lapin;
 
+mod context;
+
 use fnv::FnvHashMap;
 use lapin::{BasicProperties, Channel};
 use std::any::{Any, TypeId};
-use std::convert::Infallible;
 use std::future::Future;
 use std::ops::Deref;
 use std::sync::Arc;
@@ -12,7 +13,7 @@ use lapin::acker::Acker;
 use lapin::message::Delivery;
 use lapin::types::{DeliveryTag, ShortString};
 
-use crate::event::{Decode, Encode, Event};
+use crate::event::{Encode, Event};
 
 pub trait AMQPEvent: Event {}
 
@@ -133,6 +134,7 @@ impl FromDeliveryContext for Channel {
 pub trait FromDeliveryContext {
     fn from_delivery_context(context: &DeliveryContext) -> Self;
 }
+
 fn create_handler_context(delivery: Delivery, context: Arc<Context>) -> (DeliveryContext, Vec<u8>) {
     (
         DeliveryContext {
@@ -167,8 +169,8 @@ where
 // When the handler fn returns something its a RPC handler
 impl<T1, E, F, Fut, R> AMQPHandler<(T1, E), R> for F
 where
-    F: Fn(T1, E) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = R> + Send + Sync + 'static,
+    F: Fn(T1, E) -> Fut + Send + 'static,
+    Fut: Future<Output = R> + Send,
     E: AMQPEvent + Send + 'static,
     T1: FromDeliveryContext + Send + 'static,
     R: Encode + Send + 'static,
@@ -187,31 +189,8 @@ where
     P: Send,
     R: Send,
 {
-    fn call(
-        self,
-        delivery: Delivery,
-        context: Arc<Context>,
-    ) -> impl Future<Output = ()> + Send + 'static;
+    fn call(self, delivery: Delivery, context: Arc<Context>) -> impl Future<Output = ()> + Send;
 }
-
-#[derive(Debug)]
-struct TestEvent;
-
-impl Decode for TestEvent {
-    type Error = Infallible;
-
-    fn decode(data: &[u8]) -> Result<Self, Infallible> {
-        Ok(todo!())
-    }
-}
-
-async fn test_handler(d: State<String>, event: TestEvent) {
-    todo!()
-}
-
-impl Event for TestEvent {}
-
-impl AMQPEvent for TestEvent {}
 
 async fn spawn_handler<P, R>(h: impl AMQPHandler<P, R>)
 where
@@ -246,7 +225,30 @@ impl_handler!([T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14]);
 
 #[cfg(test)]
 mod test {
+    use std::convert::Infallible;
+
+    use crate::event::Decode;
+
     use super::*;
+
+    #[derive(Debug)]
+    struct TestEvent;
+
+    impl Decode for TestEvent {
+        type Error = Infallible;
+
+        fn decode(_: &[u8]) -> Result<Self, Infallible> {
+            todo!()
+        }
+    }
+
+    async fn test_handler(d: State<String>, event: TestEvent) {
+        todo!()
+    }
+
+    impl Event for TestEvent {}
+
+    impl AMQPEvent for TestEvent {}
     #[tokio::test]
     async fn test_context() {
         spawn_handler(test_handler).await;
