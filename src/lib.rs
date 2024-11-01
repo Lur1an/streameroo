@@ -1,2 +1,2 @@
-mod amqp;
-mod event;
+pub mod amqp;
+pub mod event;

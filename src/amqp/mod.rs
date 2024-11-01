@@ -1,5 +1,4 @@
 pub use lapin;
-
 mod context;
 
 use fnv::FnvHashMap;
@@ -150,34 +149,17 @@ fn create_handler_context(delivery: Delivery, context: Arc<Context>) -> (Deliver
     )
 }
 
-impl<T1, E, F, Fut> AMQPHandler<(T1, E), ()> for F
-where
-    F: Fn(T1, E) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = ()> + Send + Sync + 'static,
-    E: AMQPEvent + Send + 'static,
-    T1: FromDeliveryContext + Send + 'static,
-{
-    async fn call(self, delivery: Delivery, context: Arc<Context>) {
-        let (delivery_context, payload) = create_handler_context(delivery, context);
-        let event = E::decode(&payload).unwrap();
-        let t1 = T1::from_delivery_context(&delivery_context);
-        self(t1, event).await;
-        todo!()
-    }
-}
-
-// When the handler fn returns something its a RPC handler
 impl<T1, E, F, Fut, R> AMQPHandler<(T1, E), R> for F
 where
     F: Fn(T1, E) -> Fut + Send + 'static,
     Fut: Future<Output = R> + Send,
     E: AMQPEvent + Send + 'static,
     T1: FromDeliveryContext + Send + 'static,
-    R: Encode + Send + 'static,
+    R: Send + 'static,
 {
     async fn call(self, delivery: Delivery, context: Arc<Context>) {
         let (delivery_context, payload) = create_handler_context(delivery, context);
-        let event = E::decode(&payload).unwrap();
+        let event = E::decode(payload).unwrap();
         let t1 = T1::from_delivery_context(&delivery_context);
         let r = self(t1, event).await;
         todo!()
@@ -237,7 +219,7 @@ mod test {
     impl Decode for TestEvent {
         type Error = Infallible;
 
-        fn decode(_: &[u8]) -> Result<Self, Infallible> {
+        fn decode(_: Vec<u8>) -> Result<Self, Infallible> {
             todo!()
         }
     }
