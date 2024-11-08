@@ -52,7 +52,8 @@ impl Streameroo {
         P: Send,
         R: Send,
     {
-        let c: Arc<Context> = todo!();
+        let c: Arc<Context> = self.context.clone();
+        tokio::spawn(async move {});
         let d: Delivery = todo!();
         tokio::spawn(handler.call(d, c));
     }
@@ -231,8 +232,10 @@ mod test {
     impl Event for TestEvent {}
 
     impl AMQPEvent for TestEvent {}
+
     #[tokio::test]
     async fn test_context() {
-        spawn_handler(test_handler).await;
+        let app = Streameroo::new(todo!());
+        app.spawn_handler(test_handler).await;
     }
 }
