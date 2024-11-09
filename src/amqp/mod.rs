@@ -25,7 +25,13 @@ pub struct Context {
 
 pub struct Publish<E>(E);
 
-pub struct Exchange(ShortString);
+pub trait AMQPResult {}
+
+impl AMQPResult for () {}
+
+impl<E> AMQPResult for Publish<E> {}
+
+pub struct Exchange<'a>(&'a str);
 
 pub struct ReplyTo<E>(E)
 where
@@ -47,15 +53,18 @@ impl Streameroo {
         }
     }
 
-    pub async fn spawn_handler<P, R>(&self, handler: impl AMQPHandler<P, R>)
-    where
-        P: Send,
-        R: Send,
-    {
+    pub fn spawn_handler<P, T, E>(&self, handler: impl AMQPHandler<P, T, E>) {
         let c: Arc<Context> = self.context.clone();
-        tokio::spawn(async move {});
-        let d: Delivery = todo!();
-        tokio::spawn(handler.call(d, c));
+        tokio::spawn({
+            let c = c;
+            async move {
+                let c = c.clone();
+                let d: Delivery = todo!();
+                tokio::spawn(async move {
+                    let handler_result = handler.call(d, c).await;
+                });
+            }
+        });
     }
 }
 
@@ -106,7 +115,7 @@ impl<T> State<T> {
 
 pub struct StateOwned<T>(pub T);
 
-impl<T> FromDeliveryContext for StateOwned<T>
+impl<T> FromDeliveryContext<'_> for StateOwned<T>
 where
     T: Any + Send + Sync + Clone,
 {
@@ -116,7 +125,13 @@ where
     }
 }
 
-impl<T> FromDeliveryContext for State<T>
+impl<'a> FromDeliveryContext<'a> for Exchange<'a> {
+    fn from_delivery_context(context: &'a DeliveryContext) -> Self {
+        Exchange(context.exchange.as_str())
+    }
+}
+
+impl<T> FromDeliveryContext<'_> for State<T>
 where
     T: Any + Send + Sync + 'static,
 {
@@ -125,16 +140,17 @@ where
     }
 }
 
-impl FromDeliveryContext for Channel {
+impl FromDeliveryContext<'_> for Channel {
     fn from_delivery_context(context: &DeliveryContext) -> Self {
         context.global.channel.clone()
     }
 }
 
-pub trait FromDeliveryContext {
-    fn from_delivery_context(context: &DeliveryContext) -> Self;
+pub trait FromDeliveryContext<'a> {
+    fn from_delivery_context(context: &'a DeliveryContext) -> Self;
 }
 
+#[inline]
 fn create_handler_context(delivery: Delivery, context: Arc<Context>) -> (DeliveryContext, Vec<u8>) {
     (
         DeliveryContext {
@@ -150,39 +166,24 @@ fn create_handler_context(delivery: Delivery, context: Arc<Context>) -> (Deliver
     )
 }
 
-impl<T1, E, F, Fut, R> AMQPHandler<(T1, E), R> for F
+impl<P1, E, F, Fut, T, Err> AMQPHandler<(P1, E), T, Err> for F
 where
-    F: Fn(T1, E) -> Fut + Send + 'static,
-    Fut: Future<Output = R> + Send,
-    E: AMQPEvent + Send + 'static,
-    T1: FromDeliveryContext + Send + 'static,
-    R: Send + 'static,
+    F: Fn(P1, E) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<T, Err>> + Send,
+    E: AMQPEvent,
+    P1: for<'a> FromDeliveryContext<'a>,
 {
     async fn call(self, delivery: Delivery, context: Arc<Context>) {
         let (delivery_context, payload) = create_handler_context(delivery, context);
         let event = E::decode(payload).unwrap();
-        let t1 = T1::from_delivery_context(&delivery_context);
+        let t1 = P1::from_delivery_context(&delivery_context);
         let r = self(t1, event).await;
         todo!()
     }
 }
 
-pub trait AMQPHandler<P, R>
-where
-    P: Send,
-    R: Send,
-{
+pub trait AMQPHandler<P, T, E>: Send + 'static {
     fn call(self, delivery: Delivery, context: Arc<Context>) -> impl Future<Output = ()> + Send;
-}
-
-async fn spawn_handler<P, R>(h: impl AMQPHandler<P, R>)
-where
-    P: Send,
-    R: Send,
-{
-    let c: Arc<Context> = todo!();
-    let d: Delivery = todo!();
-    tokio::spawn(h.call(d, c));
 }
 
 macro_rules! impl_handler {
@@ -225,7 +226,7 @@ mod test {
         }
     }
 
-    async fn test_handler(d: State<String>, event: TestEvent) {
+    async fn test_handler(exchange: Exchange<'_>, event: TestEvent) -> Result<(), Infallible> {
         todo!()
     }
 
@@ -236,6 +237,6 @@ mod test {
     #[tokio::test]
     async fn test_context() {
         let app = Streameroo::new(todo!());
-        app.spawn_handler(test_handler).await;
+        app.spawn_handler(test_handler);
     }
 }
