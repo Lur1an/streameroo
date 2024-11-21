@@ -242,16 +242,16 @@ impl_handler!([]);
 impl_handler!([T1]);
 impl_handler!([T1, T2]);
 impl_handler!([T1, T2, T3]);
-//impl_handler!([T1, T2, T3, T4]);
-//impl_handler!([T1, T2, T3, T4, T5]);
-//impl_handler!([T1, T2, T3, T4, T5, T6]);
-//impl_handler!([T1, T2, T3, T4, T5, T6, T7]);
-//impl_handler!([T1, T2, T3, T4, T5, T6, T7, T8]);
-//impl_handler!([T1, T2, T3, T4, T5, T6, T7, T8, T9]);
-//impl_handler!([T1, T2, T3, T4, T5, T6, T7, T8, T9, T10]);
-//impl_handler!([T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11]);
-//impl_handler!([T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12]);
-//impl_handler!([T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13]);
+impl_handler!([T1, T2, T3, T4]);
+impl_handler!([T1, T2, T3, T4, T5]);
+impl_handler!([T1, T2, T3, T4, T5, T6]);
+impl_handler!([T1, T2, T3, T4, T5, T6, T7]);
+impl_handler!([T1, T2, T3, T4, T5, T6, T7, T8]);
+impl_handler!([T1, T2, T3, T4, T5, T6, T7, T8, T9]);
+impl_handler!([T1, T2, T3, T4, T5, T6, T7, T8, T9, T10]);
+impl_handler!([T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11]);
+impl_handler!([T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12]);
+impl_handler!([T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13]);
 
 #[cfg(test)]
 mod test {
