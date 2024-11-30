@@ -1,16 +1,14 @@
 use std::convert::Infallible;
 use std::fmt::Debug;
 
-pub trait Event: Sized + Debug + Decode {}
-
 pub trait Decode: Sized {
-    type Error: std::error::Error;
+    type Error: std::error::Error + Send + Sync + 'static;
 
     fn decode(data: Vec<u8>) -> Result<Self, Self::Error>;
 }
 
 pub trait Encode {
-    type Error: std::error::Error;
+    type Error: std::error::Error + Send + Sync + 'static;
 
     fn encode(&self) -> Result<Vec<u8>, Self::Error>;
 }
@@ -57,11 +55,9 @@ mod msgpack {
         }
     }
 
-    impl<E> Event for MsgPack<E> where E: Event + DeserializeOwned {}
-
     impl<E> Decode for MsgPack<E>
     where
-        E: Event + DeserializeOwned,
+        E: DeserializeOwned,
     {
         type Error = rmp_serde::decode::Error;
 
@@ -110,8 +106,6 @@ mod json {
         }
     }
 
-    impl<E> Event for Json<E> where E: Event + DeserializeOwned {}
-
     impl<E> Encode for Json<E>
     where
         E: Serialize,
@@ -125,7 +119,7 @@ mod json {
 
     impl<E> Decode for Json<E>
     where
-        E: Event + DeserializeOwned,
+        E: DeserializeOwned,
     {
         type Error = serde_json::Error;
 
