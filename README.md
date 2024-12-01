@@ -14,6 +14,7 @@ This mini-framework takes care of:
   1. Publish an event
   2. Respond to a RPC request (`reply-to`, standard)
   3. Custom?
+- Provides `ChannelExt` for slightly more convenient publishing of events
 
 ### Whats missing?
 - Batch consuming/acknowledging to maximize throughput. `streameroo` currently runs on a single `Channel`. (You can initialize multiple instances of `Streameroo` with different channels)

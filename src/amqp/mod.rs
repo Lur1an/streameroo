@@ -22,10 +22,16 @@ pub struct Streameroo {
     tasks: Vec<JoinHandle<()>>,
 }
 
+impl From<Channel> for Context {
+    fn from(channel: Channel) -> Self {
+        Self::new(channel)
+    }
+}
+
 impl Streameroo {
-    pub fn new(context: Context, consumer_tag: impl Into<String>) -> Self {
+    pub fn new(context: impl Into<Context>, consumer_tag: impl Into<String>) -> Self {
         Self {
-            context: Arc::new(context),
+            context: Arc::new(context.into()),
             consumer_tag: consumer_tag.into(),
             tasks: Vec::new(),
         }
@@ -162,6 +168,8 @@ pub enum Error {
     Handler(BoxError),
     #[error("Event Data error: {0}")]
     Event(BoxError),
+    #[error("Custom error: {0}")]
+    Custom(BoxError),
     #[error("Lapin error: {0}")]
     Lapin(#[from] lapin::Error),
 }
@@ -208,8 +216,10 @@ impl_handler!([T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13]);
 
 #[cfg(test)]
 mod test {
-    use lapin::Connection;
+    use lapin::options::QueueDeclareOptions;
+    use lapin::{BasicProperties, Connection};
     use serde::{Deserialize, Serialize};
+    use std::convert::Infallible;
     use std::sync::atomic::{AtomicU8, Ordering};
     use std::time::{Duration, Instant};
     use test_context::{test_context, AsyncTestContext};
@@ -220,6 +230,7 @@ mod test {
 
     struct AMQPTest {
         channel: Channel,
+        connection: Connection,
     }
 
     #[derive(Debug, Serialize, Deserialize)]
@@ -234,14 +245,25 @@ mod test {
                 .expect("Failed to connect to broker");
             tokio::time::sleep(Duration::from_millis(100)).await;
             let channel = connection.create_channel().await.unwrap();
-            Self { channel }
+            Self {
+                channel,
+                connection,
+            }
         }
         async fn teardown(self) {
             self.channel.close(0, "bye").await.unwrap();
         }
     }
 
-    async fn test_event_handler(
+    async fn reply_to_handler(
+        event: Json<TestEvent>,
+    ) -> anyhow::Result<PublishReply<Json<TestEvent>>> {
+        let event = event.into_inner();
+        assert_eq!(event.0, "hello");
+        Ok(PublishReply(Json(TestEvent("world".into()))))
+    }
+
+    async fn event_handler(
         counter: StateOwned<Arc<AtomicU8>>,
         exchange: Exchange,
         redelivered: Redelivered,
@@ -265,9 +287,91 @@ mod test {
         Ok(())
     }
 
+    async fn manual_ack_handler(
+        counter: StateOwned<Arc<AtomicU8>>,
+        event: Json<TestEvent>,
+    ) -> Result<DeliveryAction, Infallible> {
+        let count = counter.load(Ordering::Relaxed);
+        let event = event.into_inner();
+        assert_eq!(event.0, "hello");
+        tracing::info!(?count);
+        if count < 5 {
+            counter.fetch_add(1, Ordering::Relaxed);
+            Ok(DeliveryAction::Nack {
+                requeue: true,
+                multiple: false,
+            })
+        } else {
+            Ok(DeliveryAction::Nack {
+                multiple: false,
+                requeue: false,
+            })
+        }
+    }
+
+    #[test_context(AMQPTest)]
+    #[tokio::test]
+    async fn test_reply_to_handler(ctx: &mut AMQPTest) -> anyhow::Result<()> {
+        let queue = Uuid::new_v4().to_string();
+        ctx.channel
+            .queue_declare(
+                &queue,
+                QueueDeclareOptions {
+                    auto_delete: true,
+                    ..Default::default()
+                },
+                Default::default(),
+            )
+            .await?;
+        let mut app = Streameroo::new(ctx.channel.clone(), "test-consumer");
+        app.consume(reply_to_handler, &queue).await?;
+        let mut channel = ctx.connection.create_channel().await?;
+        let result: Json<TestEvent> = channel
+            .direct_rpc(
+                "",
+                &queue,
+                Duration::from_secs(5),
+                Json(TestEvent("hello".into())),
+            )
+            .await?;
+        assert_eq!(result.into_inner().0, "world");
+
+        Ok(())
+    }
+
     #[test_context(AMQPTest)]
     #[tokio::test]
     async fn test_manual_ack_handler(ctx: &mut AMQPTest) -> anyhow::Result<()> {
+        let queue = Uuid::new_v4().to_string();
+        ctx.channel
+            .queue_declare(
+                &queue,
+                QueueDeclareOptions {
+                    auto_delete: true,
+                    ..Default::default()
+                },
+                Default::default(),
+            )
+            .await?;
+        let counter = Arc::new(AtomicU8::new(0));
+        let mut context = Context::new(ctx.channel.clone());
+        context.data(counter.clone());
+
+        let mut app = Streameroo::new(context, "test-consumer");
+        app.consume(manual_ack_handler, &queue).await?;
+        ctx.channel
+            .publish("", &queue, Json(TestEvent("hello".into())))
+            .await?;
+        let t = Instant::now();
+        loop {
+            if counter.load(Ordering::Relaxed) == 5 {
+                break;
+            }
+            if t.elapsed().as_secs() > 5 {
+                panic!("Test timed out");
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
         Ok(())
     }
 
@@ -276,22 +380,23 @@ mod test {
     async fn test_simple_handler(ctx: &mut AMQPTest) -> anyhow::Result<()> {
         let queue = Uuid::new_v4().to_string();
         ctx.channel
-            .queue_declare(&queue, Default::default(), Default::default())
+            .queue_declare(
+                &queue,
+                QueueDeclareOptions {
+                    auto_delete: true,
+                    ..Default::default()
+                },
+                Default::default(),
+            )
             .await?;
         let counter = Arc::new(AtomicU8::new(0));
         let mut context = Context::new(ctx.channel.clone());
         context.data(counter.clone());
 
         let mut app = Streameroo::new(context, "test-consumer");
-        app.consume(test_event_handler, "test").await?;
+        app.consume(event_handler, &queue).await?;
         ctx.channel
-            .publish_with_options(
-                "",
-                &queue,
-                Default::default(),
-                Default::default(),
-                Json(TestEvent("hello".into())),
-            )
+            .publish("", &queue, Json(TestEvent("hello".into())))
             .await?;
         let t = Instant::now();
         loop {

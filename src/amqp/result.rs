@@ -91,7 +91,7 @@ where
     }
 }
 
-pub struct PublishReply<E>(E);
+pub struct PublishReply<E>(pub E);
 
 impl<E> PublishReply<E> {
     pub fn new(payload: E) -> Self {
