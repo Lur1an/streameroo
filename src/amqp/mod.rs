@@ -1,238 +1,122 @@
-pub use lapin;
+mod channel;
 mod context;
+mod result;
 
-use fnv::FnvHashMap;
-use lapin::options::BasicConsumeOptions;
-use lapin::{BasicProperties, Channel};
-use std::any::{Any, TypeId};
+pub use channel::*;
+pub use context::*;
+pub use lapin;
+
+use lapin::options::{BasicConsumeOptions, BasicNackOptions};
+use lapin::Channel;
 use std::future::Future;
-use std::ops::Deref;
 use std::sync::Arc;
+use tokio::task::{JoinError, JoinHandle};
 use tokio_stream::StreamExt;
 
-use lapin::acker::Acker;
-use lapin::message::Delivery;
-use lapin::types::{DeliveryTag, FieldTable, ShortString};
+use crate::event::Decode;
+use lapin::types::FieldTable;
+use result::AMQPResult;
 
-use crate::event::{Decode, Encode};
-
-pub struct Context {
-    /// The global lapin channel to interact with the broker
-    channel: Channel,
-    /// A generic data storage for shared instances of types
-    data: FnvHashMap<TypeId, &'static (dyn Any + Send + Sync)>,
-}
-
-pub struct Publish<E> {
-    payload: E,
-    exchange: String,
-    routing_key: String,
-}
-
-pub trait AMQPResult: Send {
-    fn handle_result(
-        self,
-        context: &DeliveryContext,
-    ) -> impl Future<Output = Result<(), Error>> + Send;
-}
-
-impl AMQPResult for () {
-    async fn handle_result(self, _: &DeliveryContext) -> Result<(), Error> {
-        Ok(())
-    }
-}
-
-impl<E> AMQPResult for Publish<E>
-where
-    E: Encode + Send,
-{
-    async fn handle_result(self, context: &DeliveryContext) -> Result<(), Error> {
-        Ok(())
-    }
-}
-
-pub struct Exchange(String);
-
-impl Deref for Exchange {
-    type Target = String;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-pub struct ReplyTo<E>(E)
-where
-    E: Encode;
-
-#[derive(Clone)]
 pub struct Streameroo {
     context: Arc<Context>,
     consumer_tag: String,
+    tasks: Vec<JoinHandle<()>>,
 }
 
 impl Streameroo {
-    pub fn new(channel: Channel, consumer_tag: impl Into<String>) -> Self {
-        let context = Context {
-            channel,
-            data: FnvHashMap::default(),
-        };
+    pub fn new(context: Context, consumer_tag: impl Into<String>) -> Self {
         Self {
             context: Arc::new(context),
             consumer_tag: consumer_tag.into(),
+            tasks: Vec::new(),
         }
     }
 
-    pub fn spawn_handler<P, T, E>(
-        &self,
+    pub fn channel(&self) -> &Channel {
+        &self.context.channel
+    }
+
+    pub async fn join(self) -> Result<(), JoinError> {
+        for task in self.tasks {
+            task.await?;
+        }
+        Ok(())
+    }
+
+    pub async fn consume<P, T, E>(
+        &mut self,
         handler: impl AMQPHandler<P, T, E>,
-        queue: impl Into<String>,
+        queue: impl AsRef<str>,
         options: BasicConsumeOptions,
         arguments: FieldTable,
-    ) where
+    ) -> lapin::Result<()>
+    where
         T: AMQPResult,
     {
         let context: Arc<Context> = self.context.clone();
-        let consumer_tag = self.consumer_tag.clone();
-        let queue = queue.into();
-        tokio::spawn(async move {
-            let Ok(mut consumer) = context
-                .channel
-                .basic_consume(&queue, &consumer_tag, options, arguments)
-                .await
-            else {
-                todo!()
-            };
-            while let Some(attempted_delivery) = consumer.next().await {
-                match attempted_delivery {
-                    Ok(delivery) => {
-                        let context = context.clone();
-                        let handler = handler.clone();
-                        tokio::spawn(async move {
-                            let (delivery_context, payload) =
-                                create_delivery_context(delivery, context);
-                            match handler.call(payload, &delivery_context).await {
-                                Ok(ret) => match ret.handle_result(&delivery_context).await {
-                                    Ok(_) => {
-                                        if let Err(e) =
-                                            delivery_context.acker.ack(Default::default()).await
+        let mut consumer = context
+            .channel
+            .basic_consume(queue.as_ref(), &self.consumer_tag, options, arguments)
+            .await?;
+        let task = tokio::spawn(async move {
+            loop {
+                if let Some(attempted_delivery) = consumer.next().await {
+                    match attempted_delivery {
+                        Ok(delivery) => {
+                            let context = context.clone();
+                            let handler = handler.clone();
+                            tokio::spawn(async move {
+                                let (delivery_context, payload) =
+                                    context::create_delivery_context(delivery, context);
+                                match handler.call(payload, &delivery_context).await {
+                                    Ok(ret) => match ret.handle_result(&delivery_context).await {
+                                        Ok(_) => {
+                                            if let Err(e) =
+                                                delivery_context.acker.ack(Default::default()).await
+                                            {
+                                                tracing::error!(?e, "Error acking delivery");
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::error!(?e, "Error processing AMQPResult");
+                                            if let Err(e) = delivery_context
+                                                .acker
+                                                .nack(BasicNackOptions {
+                                                    requeue: true,
+                                                    multiple: false,
+                                                })
+                                                .await
+                                            {
+                                                tracing::error!(?e, "Error nacking delivery");
+                                            }
+                                        }
+                                    },
+                                    Err(e) => {
+                                        tracing::error!(?e, "Handler error");
+                                        if let Err(e) = delivery_context
+                                            .acker
+                                            .nack(BasicNackOptions {
+                                                requeue: true,
+                                                multiple: false,
+                                            })
+                                            .await
                                         {
-                                            tracing::error!(?e, "Error acking delivery");
+                                            tracing::error!(?e, "Error nacking delivery");
                                         }
                                     }
-                                    Err(_) => todo!(),
-                                },
-                                Err(e) => {}
-                            }
-                        });
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            tracing::error!(?e, "Error consuming delivery");
+                        }
                     }
-                    Err(_) => todo!(),
                 }
             }
-            unreachable!()
         });
+        self.tasks.push(task);
+        Ok(())
     }
-}
-
-impl Context {
-    pub fn insert<D: Any + Send + Sync>(&mut self, data: D) {
-        let data = Box::new(data);
-        self.data.insert(TypeId::of::<D>(), Box::leak(data));
-    }
-
-    pub fn data_unchecked<D: Any + Send + Sync>(&self) -> &'static D {
-        self.data_opt::<D>().unwrap()
-    }
-
-    pub fn data_opt<D: Any + Send + Sync>(&self) -> Option<&'static D> {
-        self.data
-            .get(&TypeId::of::<D>())
-            .and_then(|x| x.downcast_ref::<D>())
-    }
-}
-
-/// The context of a Delivery. All values derivable from the derivable and global context can be accessed here.
-pub struct DeliveryContext {
-    /// Reference to the global context
-    global: Arc<Context>,
-    delivery_tag: DeliveryTag,
-    exchange: ShortString,
-    routing_key: ShortString,
-    redelivered: bool,
-    properties: BasicProperties,
-    acker: Acker,
-}
-
-pub struct State<T: 'static>(&'static T);
-
-impl<T> Deref for State<T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        self.0
-    }
-}
-
-impl<T> State<T> {
-    pub fn into_inner(self) -> &'static T {
-        self.0
-    }
-}
-
-pub struct StateOwned<T>(pub T);
-
-impl<T> FromDeliveryContext<'_> for StateOwned<T>
-where
-    T: Any + Send + Sync + Clone,
-{
-    fn from_delivery_context(context: &DeliveryContext) -> Self {
-        let value = context.global.data_unchecked::<T>().clone();
-        StateOwned(value)
-    }
-}
-
-impl FromDeliveryContext<'_> for Exchange {
-    fn from_delivery_context(context: &DeliveryContext) -> Self {
-        Exchange(context.exchange.to_string())
-    }
-}
-
-impl<T> FromDeliveryContext<'_> for State<T>
-where
-    T: Any + Send + Sync + 'static,
-{
-    fn from_delivery_context(context: &DeliveryContext) -> Self {
-        State(context.global.data_unchecked::<T>())
-    }
-}
-
-impl FromDeliveryContext<'_> for Channel {
-    fn from_delivery_context(context: &DeliveryContext) -> Self {
-        context.global.channel.clone()
-    }
-}
-
-pub trait FromDeliveryContext<'a> {
-    fn from_delivery_context(context: &'a DeliveryContext) -> Self;
-}
-
-#[inline]
-fn create_delivery_context(
-    delivery: Delivery,
-    context: Arc<Context>,
-) -> (DeliveryContext, Vec<u8>) {
-    (
-        DeliveryContext {
-            global: context,
-            delivery_tag: delivery.delivery_tag,
-            exchange: delivery.exchange,
-            routing_key: delivery.routing_key,
-            redelivered: delivery.redelivered,
-            properties: delivery.properties,
-            acker: delivery.acker,
-        },
-        delivery.data,
-    )
 }
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -303,30 +187,90 @@ impl_handler!([T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13]);
 
 #[cfg(test)]
 mod test {
-    use std::convert::Infallible;
-
-    use crate::event::Decode;
+    use lapin::Connection;
+    use serde::{Deserialize, Serialize};
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::time::{Duration, Instant};
+    use test_context::{test_context, AsyncTestContext};
 
     use super::*;
+    use crate::event::Json;
 
-    #[derive(Debug)]
-    struct TestEvent;
+    struct AMQPTest {
+        channel: Channel,
+    }
 
-    impl Decode for TestEvent {
-        type Error = Infallible;
+    #[derive(Debug, Serialize, Deserialize)]
+    struct TestEvent(String);
 
-        fn decode(_: Vec<u8>) -> Result<Self, Infallible> {
-            todo!()
+    impl AsyncTestContext for AMQPTest {
+        async fn setup() -> Self {
+            tracing_subscriber::fmt().init();
+            let url = "amqp://user:password@localhost:5672";
+            let connection = Connection::connect(url, Default::default())
+                .await
+                .expect("Failed to connect to broker");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let channel = connection.create_channel().await.unwrap();
+            Self { channel }
+        }
+        async fn teardown(self) {
+            self.channel.close(0, "bye").await.unwrap();
         }
     }
 
-    async fn test_handler(exchange: Exchange, event: TestEvent) -> anyhow::Result<()> {
-        todo!()
+    async fn test_event_handler(
+        counter: StateOwned<Arc<AtomicU8>>,
+        event: Json<TestEvent>,
+    ) -> anyhow::Result<()> {
+        let event = event.into_inner();
+        assert_eq!(event.0, "hello");
+        let count = counter.load(Ordering::Relaxed);
+        tracing::info!(?count);
+        if count < 3 {
+            counter.fetch_add(1, Ordering::Relaxed);
+            anyhow::bail!("Go again");
+        }
+        Ok(())
     }
 
+    #[test_context(AMQPTest)]
     #[tokio::test]
-    async fn test_context() {
-        let app = Streameroo::new(todo!(), "deez");
-        app.spawn_handler(test_handler, "nuts", Default::default(), Default::default());
+    async fn test_context(ctx: &mut AMQPTest) -> anyhow::Result<()> {
+        ctx.channel
+            .queue_declare("test", Default::default(), Default::default())
+            .await?;
+        let counter = Arc::new(AtomicU8::new(0));
+        let mut context = Context::new(ctx.channel.clone());
+        context.data(counter.clone());
+
+        let mut app = Streameroo::new(context, "test-consumer");
+        app.consume(
+            test_event_handler,
+            "test",
+            Default::default(),
+            Default::default(),
+        )
+        .await?;
+        ctx.channel
+            .publish(
+                "",
+                "test",
+                Default::default(),
+                Default::default(),
+                Json(TestEvent("hello".into())),
+            )
+            .await?;
+        let t = Instant::now();
+        loop {
+            if counter.load(Ordering::Relaxed) == 3 {
+                break;
+            }
+            if t.elapsed().as_secs() > 5 {
+                panic!("Test timed out");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Ok(())
     }
 }

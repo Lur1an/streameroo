@@ -41,6 +41,13 @@ mod msgpack {
     #[derive(Debug)]
     pub struct MsgPack<E>(pub E);
 
+    impl<E> MsgPack<E> {
+        /// Consumes the wrapper and returns the inner value
+        pub fn into_inner(self) -> E {
+            self.0
+        }
+    }
+
     impl<E> Deref for MsgPack<E> {
         type Target = E;
 
@@ -91,6 +98,13 @@ mod json {
 
     #[derive(Debug)]
     pub struct Json<E>(pub E);
+
+    impl<E> Json<E> {
+        /// Consumes the wrapper and returns the inner value
+        pub fn into_inner(self) -> E {
+            self.0
+        }
+    }
 
     impl<E> Deref for Json<E> {
         type Target = E;
