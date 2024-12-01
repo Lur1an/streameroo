@@ -96,5 +96,18 @@ Some common impls are:
 - `DeliveryAction` is for fine-grained control, the best way to use this is set your error type to `Infallible` and handle everything yourself by returning the correct `Deliveryaction` for your usecase. When returning this value the automatic `ack` of the framework is disabled as its taken care of by the `DeliveryAction` impl.
 - `PublishReply<E>` follows the RPC pattern for rabbitmq. It publishes the event `E` t the queue specified in the `reply-to` header.
 
+### `ChannelExt`
+ChannelExt is an extension trait for lapin's `Channel` type that allows working with events with slightly less boilerplate and reuse the wrapper types and `Decode/Encode` traits.
+The most useful one is the `direct_rpc` method which implements the direct reply to RPC pattern from the [RabbitMQ docs](https://www.rabbitmq.com/docs/direct-reply-to).
+```rust
+let result: Json<TestEvent> = channel
+    .direct_rpc(
+        "",
+        &queue,
+        Duration::from_secs(5),
+        Json(TestEvent("hello".into())),
+    )
+    .await?;
+```
 
 

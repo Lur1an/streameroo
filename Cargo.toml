@@ -5,6 +5,7 @@ edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/lur1an/streameroo"
 keywords = ["amqp", "lapin", "event"]
+description = "Compilation of mini-frameworks & utilities for data-streaming applications"
 
 [dependencies]
 fnv = "1.0.7"
