@@ -217,7 +217,7 @@ impl_handler!([T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13]);
 #[cfg(test)]
 mod test {
     use lapin::options::QueueDeclareOptions;
-    use lapin::{BasicProperties, Connection};
+    use lapin::Connection;
     use serde::{Deserialize, Serialize};
     use std::convert::Infallible;
     use std::sync::atomic::{AtomicU8, Ordering};
