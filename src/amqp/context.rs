@@ -1,13 +1,13 @@
 use fnv::FnvHashMap;
 use lapin::acker::Acker;
 use lapin::message::Delivery;
-use lapin::types::{DeliveryTag, ShortString};
+use lapin::types::ShortString;
 use lapin::{BasicProperties, Channel};
 use std::any::{Any, TypeId};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
-type Store = FnvHashMap<TypeId, &'static (dyn Any + Send + Sync)>;
+pub struct Store(FnvHashMap<TypeId, &'static (dyn Any + Send + Sync)>);
 
 pub struct Context {
     /// The global lapin channel to interact with the broker
@@ -16,33 +16,47 @@ pub struct Context {
     pub(crate) data: Store,
 }
 
+macro_rules! amqp_wrapper {
+    ($ty:ty, $inner:ty) => {
+        impl $ty {
+            pub fn into_inner(self) -> $inner {
+                self.0
+            }
+        }
+
+        impl Deref for $ty {
+            type Target = $inner;
+
+            fn deref(&self) -> &Self::Target {
+                &self.0
+            }
+        }
+    };
+}
+
 pub struct Exchange(String);
+pub struct RoutingKey(String);
+pub struct ReplyTo(Option<String>);
+pub struct DeliveryTag(u64);
+pub struct Redelivered(bool);
 
-impl Exchange {
-    pub fn into_inner(self) -> String {
-        self.0
-    }
-}
-
-impl Deref for Exchange {
-    type Target = String;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
+amqp_wrapper!(RoutingKey, String);
+amqp_wrapper!(Exchange, String);
+amqp_wrapper!(ReplyTo, Option<String>);
+amqp_wrapper!(DeliveryTag, u64);
+amqp_wrapper!(Redelivered, bool);
 
 impl Context {
     pub fn new(channel: Channel) -> Self {
         Self {
             channel,
-            data: FnvHashMap::default(),
+            data: Store(FnvHashMap::default()),
         }
     }
 
     pub fn data<D: Any + Send + Sync + 'static>(&mut self, data: D) {
         let data = Box::new(data);
-        self.data.insert(TypeId::of::<D>(), Box::leak(data));
+        self.data.0.insert(TypeId::of::<D>(), Box::leak(data));
     }
 
     pub fn data_unchecked<D: Any + Send + Sync + 'static>(&self) -> &'static D {
@@ -51,6 +65,7 @@ impl Context {
 
     pub fn data_opt<D: Any + Send + Sync + 'static>(&self) -> Option<&'static D> {
         self.data
+            .0
             .get(&TypeId::of::<D>())
             .and_then(|x| x.downcast_ref::<D>())
     }
@@ -60,7 +75,7 @@ impl Context {
 pub struct DeliveryContext {
     /// Reference to the global context
     pub(crate) global: Arc<Context>,
-    pub(crate) delivery_tag: DeliveryTag,
+    pub(crate) delivery_tag: lapin::types::DeliveryTag,
     pub(crate) exchange: ShortString,
     pub(crate) routing_key: ShortString,
     pub(crate) redelivered: bool,
@@ -122,12 +137,42 @@ impl FromDeliveryContext<'_> for Exchange {
     }
 }
 
+impl FromDeliveryContext<'_> for RoutingKey {
+    fn from_delivery_context(context: &DeliveryContext) -> Self {
+        RoutingKey(context.routing_key.to_string())
+    }
+}
+
+impl FromDeliveryContext<'_> for ReplyTo {
+    fn from_delivery_context(context: &DeliveryContext) -> Self {
+        ReplyTo(
+            context
+                .properties
+                .reply_to()
+                .as_ref()
+                .map(|s| s.to_string()),
+        )
+    }
+}
+
+impl FromDeliveryContext<'_> for DeliveryTag {
+    fn from_delivery_context(context: &DeliveryContext) -> Self {
+        DeliveryTag(context.delivery_tag)
+    }
+}
+
 impl<T> FromDeliveryContext<'_> for State<T>
 where
     T: Any + Send + Sync + 'static,
 {
     fn from_delivery_context(context: &DeliveryContext) -> Self {
         State(context.global.data_unchecked::<T>())
+    }
+}
+
+impl FromDeliveryContext<'_> for Redelivered {
+    fn from_delivery_context(context: &DeliveryContext) -> Self {
+        Redelivered(context.redelivered)
     }
 }
 

@@ -5,17 +5,16 @@ mod result;
 pub use channel::*;
 pub use context::*;
 pub use lapin;
+pub use result::*;
 
-use lapin::options::{BasicConsumeOptions, BasicNackOptions};
+use crate::event::Decode;
+use lapin::options::{BasicAckOptions, BasicConsumeOptions, BasicNackOptions};
+use lapin::types::FieldTable;
 use lapin::Channel;
 use std::future::Future;
 use std::sync::Arc;
 use tokio::task::{JoinError, JoinHandle};
 use tokio_stream::StreamExt;
-
-use crate::event::Decode;
-use lapin::types::FieldTable;
-use result::AMQPResult;
 
 pub struct Streameroo {
     context: Arc<Context>,
@@ -43,12 +42,40 @@ impl Streameroo {
         Ok(())
     }
 
+    /// Runs a consumer on the given queue with default options
+    /// - acks all successful deliveries with `multiple: false`
+    /// - nacks all failed deliveries with `requeue: true` and `multiple: false`
+    /// - Default options & fieldtable
     pub async fn consume<P, T, E>(
+        &mut self,
+        handler: impl AMQPHandler<P, T, E>,
+        queue: impl AsRef<str>,
+    ) -> lapin::Result<()>
+    where
+        T: AMQPResult,
+    {
+        self.consume_with_options(
+            handler,
+            queue,
+            Default::default(),
+            Default::default(),
+            BasicAckOptions { multiple: false },
+            BasicNackOptions {
+                requeue: true,
+                multiple: false,
+            },
+        )
+        .await
+    }
+
+    pub async fn consume_with_options<P, T, E>(
         &mut self,
         handler: impl AMQPHandler<P, T, E>,
         queue: impl AsRef<str>,
         options: BasicConsumeOptions,
         arguments: FieldTable,
+        ack_options: BasicAckOptions,
+        nack_options: BasicNackOptions,
     ) -> lapin::Result<()>
     where
         T: AMQPResult,
@@ -71,21 +98,20 @@ impl Streameroo {
                                 match handler.call(payload, &delivery_context).await {
                                     Ok(ret) => match ret.handle_result(&delivery_context).await {
                                         Ok(_) => {
+                                            // On manual AMQPResult don't ack the result handling
+                                            if T::manual() {
+                                                return;
+                                            }
                                             if let Err(e) =
-                                                delivery_context.acker.ack(Default::default()).await
+                                                delivery_context.acker.ack(ack_options).await
                                             {
                                                 tracing::error!(?e, "Error acking delivery");
                                             }
                                         }
                                         Err(e) => {
                                             tracing::error!(?e, "Error processing AMQPResult");
-                                            if let Err(e) = delivery_context
-                                                .acker
-                                                .nack(BasicNackOptions {
-                                                    requeue: true,
-                                                    multiple: false,
-                                                })
-                                                .await
+                                            if let Err(e) =
+                                                delivery_context.acker.nack(nack_options).await
                                             {
                                                 tracing::error!(?e, "Error nacking delivery");
                                             }
@@ -93,13 +119,8 @@ impl Streameroo {
                                     },
                                     Err(e) => {
                                         tracing::error!(?e, "Handler error");
-                                        if let Err(e) = delivery_context
-                                            .acker
-                                            .nack(BasicNackOptions {
-                                                requeue: true,
-                                                multiple: false,
-                                            })
-                                            .await
+                                        if let Err(e) =
+                                            delivery_context.acker.nack(nack_options).await
                                         {
                                             tracing::error!(?e, "Error nacking delivery");
                                         }
@@ -139,8 +160,8 @@ where
 pub enum Error {
     #[error("Handler error: {0}")]
     Handler(BoxError),
-    #[error("Event error: {0}")]
-    EventDecode(BoxError),
+    #[error("Event Data error: {0}")]
+    Event(BoxError),
     #[error("Lapin error: {0}")]
     Lapin(#[from] lapin::Error),
 }
@@ -160,7 +181,7 @@ macro_rules! impl_handler {
             T: AMQPResult,
         {
             async fn call(&self, payload: Vec<u8>, delivery_context: &DeliveryContext) -> Result<T, Error> {
-                let event = E::decode(payload).map_err(|e| Error::EventDecode(e.into()))?;
+                let event = E::decode(payload).map_err(|e| Error::Event(e.into()))?;
                 $(
                     let $ty = $ty::from_delivery_context(&delivery_context);
                 )*
@@ -192,6 +213,7 @@ mod test {
     use std::sync::atomic::{AtomicU8, Ordering};
     use std::time::{Duration, Instant};
     use test_context::{test_context, AsyncTestContext};
+    use uuid::Uuid;
 
     use super::*;
     use crate::event::Json;
@@ -221,12 +243,21 @@ mod test {
 
     async fn test_event_handler(
         counter: StateOwned<Arc<AtomicU8>>,
+        exchange: Exchange,
+        redelivered: Redelivered,
         event: Json<TestEvent>,
     ) -> anyhow::Result<()> {
         let event = event.into_inner();
+
+        assert_eq!(exchange.into_inner(), "");
         assert_eq!(event.0, "hello");
         let count = counter.load(Ordering::Relaxed);
         tracing::info!(?count);
+        if count == 0 {
+            assert!(!redelivered.into_inner());
+        } else {
+            assert!(redelivered.into_inner());
+        }
         if count < 3 {
             counter.fetch_add(1, Ordering::Relaxed);
             anyhow::bail!("Go again");
@@ -236,26 +267,27 @@ mod test {
 
     #[test_context(AMQPTest)]
     #[tokio::test]
-    async fn test_context(ctx: &mut AMQPTest) -> anyhow::Result<()> {
+    async fn test_manual_ack_handler(ctx: &mut AMQPTest) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    #[test_context(AMQPTest)]
+    #[tokio::test]
+    async fn test_simple_handler(ctx: &mut AMQPTest) -> anyhow::Result<()> {
+        let queue = Uuid::new_v4().to_string();
         ctx.channel
-            .queue_declare("test", Default::default(), Default::default())
+            .queue_declare(&queue, Default::default(), Default::default())
             .await?;
         let counter = Arc::new(AtomicU8::new(0));
         let mut context = Context::new(ctx.channel.clone());
         context.data(counter.clone());
 
         let mut app = Streameroo::new(context, "test-consumer");
-        app.consume(
-            test_event_handler,
-            "test",
-            Default::default(),
-            Default::default(),
-        )
-        .await?;
+        app.consume(test_event_handler, "test").await?;
         ctx.channel
-            .publish(
+            .publish_with_options(
                 "",
-                "test",
+                &queue,
                 Default::default(),
                 Default::default(),
                 Json(TestEvent("hello".into())),

@@ -21,6 +21,14 @@ impl Decode for Vec<u8> {
     }
 }
 
+impl Encode for Vec<u8> {
+    type Error = Infallible;
+
+    fn encode(&self) -> Result<Vec<u8>, Self::Error> {
+        Ok(self.clone())
+    }
+}
+
 #[cfg(feature = "bytes")]
 impl Decode for bytes::Bytes {
     type Error = Infallible;
