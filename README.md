@@ -1,6 +1,10 @@
 # streameroo
 A collection of mini-frameworks & tools for building asynchronous applications in rust.
 
+## What is this crate for?
+`streameroo` is a collection of mini-frameworks & tools for building asynchronous applications in rust.
+I built a small version of my ideas for working with AMQP using `lapin` and `tokio`, I have a few plans for working with [fluvio](https://github.com/infinyon/fluvio).
+
 ## AMQP
 
 Through traits & wrapper types you can instrument the framework to take care of a lot of boilerplate and verbose pain when working with `lapin`.
@@ -17,7 +21,8 @@ This mini-framework takes care of:
 - Provides `ChannelExt` for slightly more convenient publishing of events
 
 ### Whats missing?
-- Batch consuming/acknowledging to maximize throughput. `streameroo` currently runs on a single `Channel`. (You can initialize multiple instances of `Streameroo` with different channels)
+- Batch consuming/acknowledging to maximize throughput. `streameroo` currently runs on a single `Channel`, (You can initialize multiple instances of `Streameroo` with different channels) and also doesn't support message batching & batch acks
+
 
 ### Quickstart
 Create a struct for the event you want to handle. If you are using common formats like JSON, MsgPack or other support formats by `streameroo` all you need is a `DeserializeOwned` implementing `struct`.
@@ -41,6 +46,7 @@ Lets dissect this a bit:
 - `event`: This is the event you want to handle. The `Json` extractor instructs `streameroo` to deserialize `MyEvent` using `serde_json`. For custom protocols that are not covered by the framework you can either just use `Vec<u8>` or implement `Decode` yourself.
 
 Now you can create a `Streameroo` instance and consume events from a queue.
+The instance of the application runs on top of a `Channel`, if you want to use multiple channels you need to re-initialize the context, plans to improve on this will come later. However most of the time only a single `Channel` is used for consumption.
 ```rust
 // Connect to the broker and create a channel
 // This could be shortened and implemented on top of `Streameroo` in the future if this feels clunky

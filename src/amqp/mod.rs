@@ -74,6 +74,7 @@ impl Streameroo {
         .await
     }
 
+    /// Fully configurable queue consuming
     pub async fn consume_with_options<P, T, E>(
         &mut self,
         handler: impl AMQPHandler<P, T, E>,
@@ -87,56 +88,72 @@ impl Streameroo {
         T: AMQPResult,
     {
         let context: Arc<Context> = self.context.clone();
+        let queue = queue.as_ref();
+        // If the return type is manual or no_ack is set we skip ack/nack'ing the delivery
+        let skip_ack = T::manual() || options.no_ack;
+        tracing::info!(
+            queue,
+            consumer_tag = ?self.consumer_tag,
+            skip_ack,
+            ?options,
+            ?arguments,
+            ?ack_options,
+            ?nack_options,
+            "Starting consumer"
+        );
         let mut consumer = context
             .channel
-            .basic_consume(queue.as_ref(), &self.consumer_tag, options, arguments)
+            .basic_consume(queue, &self.consumer_tag, options, arguments)
             .await?;
         let task = tokio::spawn(async move {
-            loop {
-                if let Some(attempted_delivery) = consumer.next().await {
-                    match attempted_delivery {
-                        Ok(delivery) => {
-                            let context = context.clone();
-                            let handler = handler.clone();
-                            tokio::spawn(async move {
-                                let (delivery_context, payload) =
-                                    context::create_delivery_context(delivery, context);
-                                match handler.call(payload, &delivery_context).await {
-                                    Ok(ret) => match ret.handle_result(&delivery_context).await {
-                                        Ok(_) => {
-                                            // On manual AMQPResult don't ack the result handling
-                                            if T::manual() {
-                                                return;
-                                            }
-                                            if let Err(e) =
-                                                delivery_context.acker.ack(ack_options).await
-                                            {
-                                                tracing::error!(?e, "Error acking delivery");
-                                            }
+            while let Some(attempted_delivery) = consumer.next().await {
+                match attempted_delivery {
+                    Ok(delivery) => {
+                        let context = context.clone();
+                        let handler = handler.clone();
+                        tokio::spawn(async move {
+                            let (delivery_context, payload) =
+                                context::create_delivery_context(delivery, context);
+                            match handler.call(payload, &delivery_context).await {
+                                Ok(ret) => match ret.handle_result(&delivery_context).await {
+                                    Ok(_) => {
+                                        // On manual AMQPResult don't ack the result handling
+                                        if skip_ack {
+                                            return;
                                         }
-                                        Err(e) => {
-                                            tracing::error!(?e, "Error processing AMQPResult");
-                                            if let Err(e) =
-                                                delivery_context.acker.nack(nack_options).await
-                                            {
-                                                tracing::error!(?e, "Error nacking delivery");
-                                            }
+                                        if let Err(e) =
+                                            delivery_context.acker.ack(ack_options).await
+                                        {
+                                            tracing::error!(?e, "Error acking delivery");
                                         }
-                                    },
+                                    }
                                     Err(e) => {
-                                        tracing::error!(?e, "Handler error");
+                                        tracing::error!(?e, "Error processing AMQPResult");
+                                        if skip_ack {
+                                            return;
+                                        }
                                         if let Err(e) =
                                             delivery_context.acker.nack(nack_options).await
                                         {
                                             tracing::error!(?e, "Error nacking delivery");
                                         }
                                     }
+                                },
+                                Err(e) => {
+                                    tracing::error!(?e, "Handler error");
+                                    if skip_ack {
+                                        return;
+                                    }
+                                    if let Err(e) = delivery_context.acker.nack(nack_options).await
+                                    {
+                                        tracing::error!(?e, "Error nacking delivery");
+                                    }
                                 }
-                            });
-                        }
-                        Err(e) => {
-                            tracing::error!(?e, "Error consuming delivery");
-                        }
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::error!(?e, "Error consuming delivery");
                     }
                 }
             }
@@ -168,8 +185,10 @@ pub enum Error {
     Handler(BoxError),
     #[error("Event Data error: {0}")]
     Event(BoxError),
-    #[error("Custom error: {0}")]
-    Custom(BoxError),
+    #[error("Consumer stream closed")]
+    StreamClosed,
+    #[error(transparent)]
+    Timeout(#[from] tokio::time::error::Elapsed),
     #[error("Lapin error: {0}")]
     Lapin(#[from] lapin::Error),
 }

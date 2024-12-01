@@ -104,12 +104,10 @@ impl ChannelExt for lapin::Channel {
                 let payload = delivery.data;
                 T::decode(payload).map_err(|e| Error::Event(e.into()))
             } else {
-                Err(Error::Custom("Stream terminated".into()))
+                Err(Error::StreamClosed)
             }
         };
-        tokio::time::timeout(timeout, fut)
-            .await
-            .map_err(|e| Error::Custom(e.into()))?
+        tokio::time::timeout(timeout, fut).await?
     }
 
     async fn publish_with_options<E>(
