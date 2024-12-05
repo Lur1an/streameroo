@@ -140,7 +140,7 @@ impl Streameroo {
                                     }
                                 },
                                 Err(e) => {
-                                    tracing::error!(?e, "Handler error");
+                                    tracing::error!(?e, "Error calling AMQP handler");
                                     if skip_ack {
                                         return;
                                     }

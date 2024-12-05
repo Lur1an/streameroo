@@ -11,7 +11,7 @@ pub struct Store(FnvHashMap<TypeId, &'static (dyn Any + Send + Sync)>);
 
 pub struct Context {
     /// The global lapin channel to interact with the broker
-    pub(crate) channel: Channel,
+    pub channel: Channel,
     /// A generic data storage for shared instances of types
     pub(crate) data: Store,
 }
