@@ -16,7 +16,9 @@ pub struct Publish<E> {
 }
 
 impl<E> Publish<E> {
-    pub fn new(payload: E, exchange: String, routing_key: String) -> Self {
+    pub fn new(payload: E, exchange: impl Into<String>, routing_key: impl Into<String>) -> Self {
+        let exchange = exchange.into();
+        let routing_key = routing_key.into();
         Self {
             payload,
             exchange,
@@ -114,4 +116,3 @@ where
         Ok(())
     }
 }
-
