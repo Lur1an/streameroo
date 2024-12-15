@@ -1,9 +1,11 @@
 mod channel;
 mod context;
+mod extensions;
 mod result;
 
 pub use channel::*;
 pub use context::*;
+pub use extensions::*;
 pub use lapin;
 pub use result::*;
 
