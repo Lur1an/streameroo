@@ -139,6 +139,22 @@ mod json {
         }
     }
 
+    impl Encode for serde_json::Value {
+        type Error = serde_json::Error;
+
+        fn encode(&self) -> Result<Vec<u8>, Self::Error> {
+            serde_json::to_vec(&self)
+        }
+    }
+
+    impl Decode for serde_json::Value {
+        type Error = serde_json::Error;
+
+        fn decode(data: Vec<u8>) -> Result<Self, Self::Error> {
+            serde_json::from_slice(&data)
+        }
+    }
+
     impl<E> Decode for Json<E>
     where
         E: DeserializeOwned,
