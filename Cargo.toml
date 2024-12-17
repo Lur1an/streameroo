@@ -1,6 +1,6 @@
 [package]
 name = "streameroo"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/lur1an/streameroo"
@@ -19,6 +19,7 @@ tokio = { version = "1.40.0", features = ["full", "rt"], optional = true }
 thiserror = "2.0.3"
 tracing = "0.1.41"
 tokio-stream = "0.1.16"
+bson = { version = "2.13.0", optional = true }
 
 [profile.release]
 panic = "abort"
@@ -28,6 +29,7 @@ default = ["tokio", "json"]
 tokio = ["dep:tokio"]
 msgpack = ["serde", "rmp-serde"]
 json = ["serde", "serde_json"]
+bson = ["dep:bson"]
 bytes = ["dep:bytes"]
 
 [dev-dependencies]

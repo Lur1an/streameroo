@@ -169,3 +169,61 @@ mod json {
 
 #[cfg(feature = "json")]
 pub use json::*;
+
+#[cfg(feature = "bson")]
+mod streameroo_bson {
+    use std::ops::{Deref, DerefMut};
+
+    use super::*;
+    use serde::de::DeserializeOwned;
+    use serde::Serialize;
+
+    #[derive(Debug)]
+    pub struct Bson<E>(pub E);
+
+    impl<E> Bson<E> {
+        /// Consumes the wrapper and returns the inner value
+        pub fn into_inner(self) -> E {
+            self.0
+        }
+    }
+
+    impl<E> Deref for Bson<E> {
+        type Target = E;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl<E> DerefMut for Bson<E> {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.0
+        }
+    }
+
+    impl<E> Decode for Bson<E>
+    where
+        E: DeserializeOwned,
+    {
+        type Error = bson::de::Error;
+
+        fn decode(data: Vec<u8>) -> Result<Self, Self::Error> {
+            Ok(Bson(bson::from_slice(&data)?))
+        }
+    }
+
+    impl<E> Encode for Bson<E>
+    where
+        E: Serialize,
+    {
+        type Error = bson::ser::Error;
+
+        fn encode(&self) -> Result<Vec<u8>, Self::Error> {
+            bson::to_vec(&self.0)
+        }
+    }
+}
+
+#[cfg(feature = "bson")]
+pub use streameroo_bson::*;

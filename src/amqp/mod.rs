@@ -1,8 +1,10 @@
+mod auto;
 mod channel;
 mod context;
 mod extensions;
 mod result;
 
+pub use auto::*;
 pub use channel::*;
 pub use context::*;
 pub use extensions::*;
@@ -141,6 +143,21 @@ impl Streameroo {
                                         }
                                     }
                                 },
+                                // Decoding an event failed, this would fail again if we nacked the
+                                // delivery, so the framework automatically nacks without requeue.
+                                Err(Error::Event(e)) => {
+                                    tracing::error!(?e, "Error decoding event");
+                                    if let Err(e) = delivery_context
+                                        .acker
+                                        .nack(BasicNackOptions {
+                                            requeue: false,
+                                            multiple: nack_options.multiple,
+                                        })
+                                        .await
+                                    {
+                                        tracing::error!(?e, "Error acking delivery");
+                                    }
+                                }
                                 Err(e) => {
                                     tracing::error!(?e, "Error calling AMQP handler");
                                     if skip_ack {
@@ -195,6 +212,25 @@ pub enum Error {
     Lapin(#[from] lapin::Error),
 }
 
+impl Error {
+    pub(crate) fn event(e: impl Into<BoxError>) -> Self {
+        Self::Event(e.into())
+    }
+}
+
+pub trait AMQPDecode: Sized {
+    fn decode(payload: Vec<u8>, context: &DeliveryContext) -> Result<Self, Error>;
+}
+
+impl<E> AMQPDecode for E
+where
+    E: Decode,
+{
+    fn decode(payload: Vec<u8>, _: &DeliveryContext) -> Result<Self, Error> {
+        E::decode(payload).map_err(Error::event)
+    }
+}
+
 macro_rules! impl_handler {
     (
         [$($ty:ident),*]
@@ -206,11 +242,11 @@ macro_rules! impl_handler {
             Err: Into<BoxError>,
             Fut: Future<Output = Result<T, Err>> + Send,
             $( $ty: for<'a> FromDeliveryContext<'a>, )*
-            E: Decode,
+            E: AMQPDecode,
             T: AMQPResult,
         {
             async fn call(&self, payload: Vec<u8>, delivery_context: &DeliveryContext) -> Result<T, Error> {
-                let event = E::decode(payload).map_err(|e| Error::Event(e.into()))?;
+                let event = E::decode(payload, delivery_context)?;
                 $(
                     let $ty = $ty::from_delivery_context(&delivery_context);
                 )*
