@@ -272,26 +272,16 @@ impl_handler!([T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12]);
 impl_handler!([T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13]);
 
 #[cfg(test)]
-mod test {
-    use lapin::options::QueueDeclareOptions;
-    use lapin::Connection;
-    use serde::{Deserialize, Serialize};
-    use std::convert::Infallible;
-    use std::sync::atomic::{AtomicU8, Ordering};
-    use std::time::{Duration, Instant};
-    use test_context::{test_context, AsyncTestContext};
-    use uuid::Uuid;
+mod amqp_test {
+    use std::time::Duration;
 
-    use super::*;
-    use crate::event::Json;
+    use lapin::{Channel, Connection};
+    use test_context::AsyncTestContext;
 
-    struct AMQPTest {
-        channel: Channel,
-        connection: Connection,
+    pub struct AMQPTest {
+        pub channel: Channel,
+        pub connection: Connection,
     }
-
-    #[derive(Debug, Serialize, Deserialize)]
-    struct TestEvent(String);
 
     impl AsyncTestContext for AMQPTest {
         async fn setup() -> Self {
@@ -311,6 +301,23 @@ mod test {
             self.channel.close(0, "bye").await.unwrap();
         }
     }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::event::Json;
+    use amqp_test::AMQPTest;
+    use lapin::options::QueueDeclareOptions;
+    use serde::{Deserialize, Serialize};
+    use std::convert::Infallible;
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::time::{Duration, Instant};
+    use test_context::test_context;
+    use uuid::Uuid;
+
+    #[derive(Debug, Serialize, Deserialize)]
+    struct TestEvent(String);
 
     async fn reply_to_handler(
         event: Json<TestEvent>,

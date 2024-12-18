@@ -27,19 +27,45 @@ pub enum XQueueType {
 impl From<XQueueType> for AMQPValue {
     fn from(x: XQueueType) -> Self {
         match x {
-            XQueueType::Classic => AMQPValue::ShortString("classic".into()),
-            XQueueType::Quorum => AMQPValue::ShortString("quorum".into()),
-            XQueueType::Stream => AMQPValue::ShortString("stream".into()),
+            XQueueType::Classic => AMQPValue::LongString("classic".into()),
+            XQueueType::Quorum => AMQPValue::LongString("quorum".into()),
+            XQueueType::Stream => AMQPValue::LongString("stream".into()),
         }
     }
 }
 
 #[cfg(test)]
 mod test {
+    use lapin::options::{QueueDeclareOptions, QueueDeleteOptions};
     use lapin::types::{FieldTable, ShortString};
     use std::collections::BTreeMap;
+    use test_context::test_context;
+
+    use crate::amqp::amqp_test::AMQPTest;
 
     use super::*;
+
+    #[test_context(AMQPTest)]
+    #[tokio::test]
+    async fn test_field_table_quorum(ctx: &mut AMQPTest) -> anyhow::Result<()> {
+        ctx.channel
+            .queue_declare(
+                "test",
+                QueueDeclareOptions {
+                    durable: true,
+                    ..Default::default()
+                },
+                field_table!(
+                    ("x-queue-type", XQueueType::Quorum),
+                    ("x-delivery-limit", 6)
+                ),
+            )
+            .await?;
+        ctx.channel
+            .queue_delete("test", QueueDeleteOptions::default())
+            .await?;
+        Ok(())
+    }
 
     #[test]
     fn test_field_table() {
@@ -50,7 +76,7 @@ mod test {
         let expected = FieldTable::from(BTreeMap::from([
             (
                 ShortString::from("x-queue-type"),
-                AMQPValue::ShortString("quorum".into()),
+                AMQPValue::LongString("quorum".into()),
             ),
             (ShortString::from("x-delivery-limit"), AMQPValue::from(6)),
         ]));
