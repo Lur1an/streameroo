@@ -1,3 +1,5 @@
+use std::ops::{Deref, DerefMut};
+
 use serde::de::DeserializeOwned;
 
 use super::{AMQPDecode, Error};
@@ -5,6 +7,20 @@ use super::{AMQPDecode, Error};
 /// Type to instruct the framework to auto decode the event given its content-type and content-encoding headers
 /// with a serde-compatible deserializer.
 pub struct Auto<T>(pub T);
+
+impl<T> Deref for Auto<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T> DerefMut for Auto<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
 
 impl<T> AMQPDecode for Auto<T>
 where
