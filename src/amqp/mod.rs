@@ -99,9 +99,12 @@ impl Streameroo {
         let queue = queue.as_ref();
         // If the return type is manual or no_ack is set we skip ack/nack'ing the delivery
         let skip_ack = T::manual() || options.no_ack;
+        let consumer_tag = consumer_tag_override
+            .map(Into::into)
+            .unwrap_or(format!("{}-{}", self.consumer_tag, queue));
         tracing::info!(
             queue,
-            consumer_tag = ?self.consumer_tag,
+            consumer_tag,
             skip_ack,
             ?options,
             ?arguments,
@@ -109,9 +112,6 @@ impl Streameroo {
             ?nack_options,
             "Starting consumer"
         );
-        let consumer_tag = consumer_tag_override
-            .map(Into::into)
-            .unwrap_or(format!("{}-{}", self.consumer_tag, queue));
         let mut consumer = context
             .channel
             .basic_consume(queue, &consumer_tag, options, arguments)
