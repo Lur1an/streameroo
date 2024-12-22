@@ -1766,7 +1766,7 @@ dependencies = [
 
 [[package]]
 name = "streameroo"
-version = "0.1.7"
+version = "0.1.77"
 dependencies = [
  "anyhow",
  "bson",

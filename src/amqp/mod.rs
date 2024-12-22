@@ -10,6 +10,7 @@ pub use context::*;
 pub use extensions::*;
 pub use lapin;
 pub use result::*;
+use tracing::{Instrument, Level};
 
 use crate::event::Decode;
 use lapin::options::{BasicAckOptions, BasicConsumeOptions, BasicNackOptions};
@@ -74,11 +75,13 @@ impl Streameroo {
                 requeue: true,
                 multiple: false,
             },
+            None::<String>,
         )
         .await
     }
 
     /// Fully configurable queue consuming
+    #[allow(clippy::too_many_arguments)]
     pub async fn consume_with_options<P, T, E>(
         &mut self,
         handler: impl AMQPHandler<P, T, E>,
@@ -87,6 +90,7 @@ impl Streameroo {
         arguments: FieldTable,
         ack_options: BasicAckOptions,
         nack_options: BasicNackOptions,
+        consumer_tag_override: Option<impl Into<String>>,
     ) -> lapin::Result<()>
     where
         T: AMQPResult,
@@ -105,9 +109,12 @@ impl Streameroo {
             ?nack_options,
             "Starting consumer"
         );
+        let consumer_tag = consumer_tag_override
+            .map(Into::into)
+            .unwrap_or(format!("{}-{}", self.consumer_tag, queue));
         let mut consumer = context
             .channel
-            .basic_consume(queue, &self.consumer_tag, options, arguments)
+            .basic_consume(queue, &consumer_tag, options, arguments)
             .await?;
         let task = tokio::spawn(async move {
             while let Some(attempted_delivery) = consumer.next().await {
@@ -115,7 +122,8 @@ impl Streameroo {
                     Ok(delivery) => {
                         let context = context.clone();
                         let handler = handler.clone();
-                        tokio::spawn(async move {
+                        let delivery_tag = delivery.delivery_tag;
+                        let fut = async move {
                             let (delivery_context, payload) =
                                 context::create_delivery_context(delivery, context);
                             match handler.call(payload, &delivery_context).await {
@@ -169,7 +177,12 @@ impl Streameroo {
                                     }
                                 }
                             }
-                        });
+                        };
+                        tokio::spawn(fut.instrument(tracing::span!(
+                            Level::INFO,
+                            "streameroo::amqp",
+                            delivery_tag
+                        )));
                     }
                     Err(e) => {
                         tracing::error!(?e, "Error consuming delivery");
