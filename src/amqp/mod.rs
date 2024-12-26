@@ -133,6 +133,7 @@ impl Streameroo {
                                         if skip_ack {
                                             return;
                                         }
+                                        tracing::info!(?ack_options, "Acking delivery");
                                         if let Err(e) =
                                             delivery_context.acker.ack(ack_options).await
                                         {
@@ -144,6 +145,7 @@ impl Streameroo {
                                         if skip_ack {
                                             return;
                                         }
+                                        tracing::info!(?nack_options, "Nacking delivery");
                                         if let Err(e) =
                                             delivery_context.acker.nack(nack_options).await
                                         {
@@ -155,13 +157,12 @@ impl Streameroo {
                                 // delivery, so the framework automatically nacks without requeue.
                                 Err(Error::Event(e)) => {
                                     tracing::error!(?e, "Error decoding event");
-                                    if let Err(e) = delivery_context
-                                        .acker
-                                        .nack(BasicNackOptions {
-                                            requeue: false,
-                                            multiple: nack_options.multiple,
-                                        })
-                                        .await
+                                    let nack_options = BasicNackOptions {
+                                        requeue: false,
+                                        multiple: nack_options.multiple,
+                                    };
+                                    tracing::info!(?nack_options, "Nacking delivery");
+                                    if let Err(e) = delivery_context.acker.nack(nack_options).await
                                     {
                                         tracing::error!(?e, "Error acking delivery");
                                     }
@@ -171,6 +172,7 @@ impl Streameroo {
                                     if skip_ack {
                                         return;
                                     }
+                                    tracing::info!(?nack_options, "Nacking delivery");
                                     if let Err(e) = delivery_context.acker.nack(nack_options).await
                                     {
                                         tracing::error!(?e, "Error nacking delivery");
