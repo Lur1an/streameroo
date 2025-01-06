@@ -11,6 +11,10 @@ pub trait Encode {
     type Error: std::error::Error + Send + Sync + 'static;
 
     fn encode(&self) -> Result<Vec<u8>, Self::Error>;
+
+    fn content_type() -> Option<&'static str> {
+        None
+    }
 }
 
 impl Decode for Vec<u8> {
@@ -90,6 +94,10 @@ mod msgpack {
         fn encode(&self) -> Result<Vec<u8>, Self::Error> {
             rmp_serde::to_vec(&self.0)
         }
+
+        fn content_type() -> Option<&'static str> {
+            Some("application/msgpack")
+        }
     }
 }
 
@@ -137,6 +145,10 @@ mod json {
         fn encode(&self) -> Result<Vec<u8>, Self::Error> {
             serde_json::to_vec(&self.0)
         }
+
+        fn content_type() -> Option<&'static str> {
+            Some("application/json")
+        }
     }
 
     impl Encode for serde_json::Value {
@@ -144,6 +156,10 @@ mod json {
 
         fn encode(&self) -> Result<Vec<u8>, Self::Error> {
             serde_json::to_vec(&self)
+        }
+
+        fn content_type() -> Option<&'static str> {
+            Some("application/json")
         }
     }
 
@@ -221,6 +237,10 @@ mod streameroo_bson {
 
         fn encode(&self) -> Result<Vec<u8>, Self::Error> {
             bson::to_vec(&self.0)
+        }
+
+        fn content_type() -> Option<&'static str> {
+            Some("application/bson")
         }
     }
 }

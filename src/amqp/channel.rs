@@ -115,13 +115,18 @@ impl ChannelExt for lapin::Channel {
         exchange: impl AsRef<str>,
         routing_key: impl AsRef<str>,
         options: BasicPublishOptions,
-        properties: BasicProperties,
+        mut properties: BasicProperties,
         event: E,
     ) -> Result<(), Error>
     where
         E: Encode,
     {
         let payload = event.encode().map_err(|e| Error::Event(e.into()))?;
+        if properties.content_type().is_none() {
+            if let Some(content_type) = E::content_type() {
+                properties = properties.with_content_type(content_type.into());
+            }
+        }
         self.basic_publish(
             exchange.as_ref(),
             routing_key.as_ref(),
