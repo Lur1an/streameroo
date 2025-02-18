@@ -17,8 +17,9 @@ use lapin::types::FieldTable;
 use lapin::Channel;
 use std::future::Future;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_stream::StreamExt;
 use tracing::{Instrument, Level};
 
@@ -44,7 +45,7 @@ impl Streameroo {
                 tokio::signal::ctrl_c()
                     .await
                     .expect("Failed to listen for shutdown signal");
-                shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+                shutdown.store(true, Relaxed);
             }
         });
         Self {
@@ -132,8 +133,9 @@ impl Streameroo {
             .await?;
         let shutdown = self.shutdown.clone();
         let fut = async move {
+            let mut tasks = JoinSet::new();
             loop {
-                if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                if shutdown.load(Relaxed) {
                     tracing::info!("Shutting down consumer");
                     break;
                 }
@@ -194,13 +196,16 @@ impl Streameroo {
                             }
                         }
                     };
-                    tokio::spawn(fut.instrument(tracing::span!(
+                    tasks.spawn(fut.instrument(tracing::span!(
                         Level::INFO,
                         "streameroo::amqp",
                         delivery_tag
                     )));
                 }
+                // Drain the taskset as it might become full otherwise
+                while tasks.try_join_next().is_some() {}
             }
+            tasks.join_all().await;
             Ok::<_, lapin::Error>(())
         };
         let task = tokio::spawn(fut);
@@ -336,6 +341,8 @@ mod test {
     use crate::event::Json;
     use amqp_test::AMQPTest;
     use lapin::options::QueueDeclareOptions;
+    use nix::sys::signal::Signal;
+    use nix::unistd::Pid;
     use serde::{Deserialize, Serialize};
     use std::convert::Infallible;
     use std::sync::atomic::{AtomicU8, Ordering};
@@ -354,6 +361,9 @@ mod test {
         Ok(PublishReply(Json(TestEvent("world".into()))))
     }
 
+    /// This event handler "nacks" messages whilst the count is < 3 after incrementing.
+    /// This lets us assume that it is redelivered when the count is not 0, and fresh otherwise.
+    /// The content of the event needs to be equal to "hello".
     async fn event_handler(
         counter: StateOwned<Arc<AtomicU8>>,
         exchange: Exchange,
@@ -499,6 +509,39 @@ mod test {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        Ok(())
+    }
+
+    #[test_context(AMQPTest)]
+    #[tokio::test]
+    async fn test_simple_handler_graceful_shutdown(ctx: &mut AMQPTest) -> anyhow::Result<()> {
+        let queue = Uuid::new_v4().to_string();
+        ctx.channel
+            .queue_declare(
+                &queue,
+                QueueDeclareOptions {
+                    auto_delete: true,
+                    ..Default::default()
+                },
+                Default::default(),
+            )
+            .await?;
+        let counter = Arc::new(AtomicU8::new(0));
+        let mut context = Context::new(ctx.channel.clone());
+        context.data(counter.clone());
+
+        let mut app = Streameroo::new(context, "test-consumer");
+        app.consume(event_handler, &queue).await?;
+        nix::sys::signal::kill(Pid::this(), Signal::SIGINT).unwrap();
+        ctx.channel
+            .publish("", &queue, Json(TestEvent("hello".into())))
+            .await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Use timeout as if the signal handling fails `app.join` will never complete
+        tokio::time::timeout(Duration::from_secs(2), app.join()).await??;
+        // We killed the process, however the handler has been spawned once since we don't abort
+        // the delivery consumption future.
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
         Ok(())
     }
 }
