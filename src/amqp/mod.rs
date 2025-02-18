@@ -16,6 +16,7 @@ use lapin::options::{BasicAckOptions, BasicConsumeOptions, BasicNackOptions};
 use lapin::types::FieldTable;
 use lapin::Channel;
 use std::future::Future;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
@@ -24,6 +25,7 @@ use tracing::{Instrument, Level};
 pub struct Streameroo {
     context: Arc<Context>,
     consumer_tag: String,
+    shutdown: Arc<AtomicBool>,
     tasks: Vec<JoinHandle<Result<(), lapin::Error>>>,
 }
 
@@ -35,7 +37,18 @@ impl From<Channel> for Context {
 
 impl Streameroo {
     pub fn new(context: impl Into<Context>, consumer_tag: impl Into<String>) -> Self {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        tokio::spawn({
+            let shutdown = shutdown.clone();
+            async move {
+                tokio::signal::ctrl_c()
+                    .await
+                    .expect("Failed to listen for shutdown signal");
+                shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
         Self {
+            shutdown,
             context: Arc::new(context.into()),
             consumer_tag: consumer_tag.into(),
             tasks: Vec::new(),
@@ -117,29 +130,60 @@ impl Streameroo {
             .channel
             .basic_consume(queue, &consumer_tag, options, arguments)
             .await?;
-        let task = tokio::spawn(async move {
-            while let Some(attempted_delivery) = consumer.next().await {
-                let delivery = attempted_delivery?;
-                let context = context.clone();
-                let handler = handler.clone();
-                let delivery_tag = delivery.delivery_tag;
-                let fut = async move {
-                    let (delivery_context, payload) =
-                        context::create_delivery_context(delivery, context);
-                    match handler.call(payload, &delivery_context).await {
-                        Ok(ret) => match ret.handle_result(&delivery_context).await {
-                            Ok(_) => {
-                                // On manual AMQPResult don't ack the result handling
-                                if skip_ack {
-                                    return;
+        let shutdown = self.shutdown.clone();
+        let fut = async move {
+            loop {
+                if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                    tracing::info!("Shutting down consumer");
+                    break;
+                }
+                if let Some(attempted_delivery) = consumer.next().await {
+                    let delivery = attempted_delivery?;
+                    let context = context.clone();
+                    let handler = handler.clone();
+                    let delivery_tag = delivery.delivery_tag;
+                    let fut = async move {
+                        let (delivery_context, payload) =
+                            context::create_delivery_context(delivery, context);
+                        match handler.call(payload, &delivery_context).await {
+                            Ok(ret) => match ret.handle_result(&delivery_context).await {
+                                Ok(_) => {
+                                    // On manual AMQPResult don't ack the result handling
+                                    if skip_ack {
+                                        return;
+                                    }
+                                    tracing::info!(?ack_options, "Acking delivery");
+                                    if let Err(e) = delivery_context.acker.ack(ack_options).await {
+                                        tracing::error!(?e, "Error acking delivery");
+                                    }
                                 }
-                                tracing::info!(?ack_options, "Acking delivery");
-                                if let Err(e) = delivery_context.acker.ack(ack_options).await {
+                                Err(e) => {
+                                    tracing::error!(?e, "Error processing AMQPResult");
+                                    if skip_ack {
+                                        return;
+                                    }
+                                    tracing::info!(?nack_options, "Nacking delivery");
+                                    if let Err(e) = delivery_context.acker.nack(nack_options).await
+                                    {
+                                        tracing::error!(?e, "Error nacking delivery");
+                                    }
+                                }
+                            },
+                            // Decoding an event failed, this would fail again if we nacked the
+                            // delivery, so the framework automatically nacks without requeue.
+                            Err(Error::Event(e)) => {
+                                tracing::error!(?e, "Error decoding event");
+                                let nack_options = BasicNackOptions {
+                                    requeue: false,
+                                    multiple: nack_options.multiple,
+                                };
+                                tracing::info!(?nack_options, "Nacking delivery");
+                                if let Err(e) = delivery_context.acker.nack(nack_options).await {
                                     tracing::error!(?e, "Error acking delivery");
                                 }
                             }
                             Err(e) => {
-                                tracing::error!(?e, "Error processing AMQPResult");
+                                tracing::error!(?e, "Error calling AMQP handler");
                                 if skip_ack {
                                     return;
                                 }
@@ -148,40 +192,18 @@ impl Streameroo {
                                     tracing::error!(?e, "Error nacking delivery");
                                 }
                             }
-                        },
-                        // Decoding an event failed, this would fail again if we nacked the
-                        // delivery, so the framework automatically nacks without requeue.
-                        Err(Error::Event(e)) => {
-                            tracing::error!(?e, "Error decoding event");
-                            let nack_options = BasicNackOptions {
-                                requeue: false,
-                                multiple: nack_options.multiple,
-                            };
-                            tracing::info!(?nack_options, "Nacking delivery");
-                            if let Err(e) = delivery_context.acker.nack(nack_options).await {
-                                tracing::error!(?e, "Error acking delivery");
-                            }
                         }
-                        Err(e) => {
-                            tracing::error!(?e, "Error calling AMQP handler");
-                            if skip_ack {
-                                return;
-                            }
-                            tracing::info!(?nack_options, "Nacking delivery");
-                            if let Err(e) = delivery_context.acker.nack(nack_options).await {
-                                tracing::error!(?e, "Error nacking delivery");
-                            }
-                        }
-                    }
-                };
-                tokio::spawn(fut.instrument(tracing::span!(
-                    Level::INFO,
-                    "streameroo::amqp",
-                    delivery_tag
-                )));
+                    };
+                    tokio::spawn(fut.instrument(tracing::span!(
+                        Level::INFO,
+                        "streameroo::amqp",
+                        delivery_tag
+                    )));
+                }
             }
             Ok::<_, lapin::Error>(())
-        });
+        };
+        let task = tokio::spawn(fut);
         self.tasks.push(task);
         Ok(())
     }
