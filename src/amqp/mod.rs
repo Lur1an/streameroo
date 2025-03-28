@@ -39,15 +39,6 @@ impl From<Channel> for Context {
 impl Streameroo {
     pub fn new(context: impl Into<Context>, consumer_tag: impl Into<String>) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
-        tokio::spawn({
-            let shutdown = shutdown.clone();
-            async move {
-                tokio::signal::ctrl_c()
-                    .await
-                    .expect("Failed to listen for shutdown signal");
-                shutdown.store(true, Relaxed);
-            }
-        });
         Self {
             shutdown,
             context: Arc::new(context.into()),
@@ -60,7 +51,18 @@ impl Streameroo {
         &self.context.channel
     }
 
-    pub async fn join(self) -> Result<(), lapin::Error> {
+    pub async fn join(self, graceful: bool) -> Result<(), lapin::Error> {
+        if graceful {
+            tokio::spawn({
+                async move {
+                    tokio::signal::ctrl_c()
+                        .await
+                        .expect("Failed to listen for shutdown signal");
+                    tracing::info!("Shutdown intercepted, disabling consumers");
+                    self.shutdown.store(true, Relaxed);
+                }
+            });
+        }
         for task in self.tasks {
             // Tasks should never have a JoinError as we don't interfere with the handles
             task.await.expect("JoinError")?;
@@ -377,9 +379,9 @@ mod test {
         let count = counter.load(Ordering::Relaxed);
         tracing::info!(?count);
         if count == 0 {
-            assert!(!redelivered.into_inner());
+            assert!(!*redelivered);
         } else {
-            assert!(redelivered.into_inner());
+            assert!(*redelivered);
         }
         if count < 3 {
             counter.fetch_add(1, Ordering::Relaxed);
@@ -532,13 +534,16 @@ mod test {
 
         let mut app = Streameroo::new(context, "test-consumer");
         app.consume(event_handler, &queue).await?;
+        let join = tokio::spawn(app.join(true));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
         nix::sys::signal::kill(Pid::this(), Signal::SIGINT).unwrap();
         ctx.channel
             .publish("", &queue, Json(TestEvent("hello".into())))
             .await?;
         tokio::time::sleep(Duration::from_millis(100)).await;
         // Use timeout as if the signal handling fails `app.join` will never complete
-        tokio::time::timeout(Duration::from_secs(2), app.join()).await??;
+        tokio::time::timeout(Duration::from_secs(2), join).await???;
         // We killed the process, however the handler has been spawned once since we don't abort
         // the delivery consumption future.
         assert_eq!(counter.load(Ordering::Relaxed), 1);
