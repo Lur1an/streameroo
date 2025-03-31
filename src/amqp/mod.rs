@@ -200,7 +200,7 @@ impl Streameroo {
                     };
                     tasks.spawn(fut.instrument(tracing::span!(
                         Level::INFO,
-                        "streameroo::amqp",
+                        "streameroo",
                         delivery_tag
                     )));
                 }
