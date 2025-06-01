@@ -2,6 +2,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use lapin::options::{BasicConsumeOptions, BasicPublishOptions};
+use lapin::publisher_confirm::PublisherConfirm;
 use lapin::BasicProperties;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
@@ -18,7 +19,7 @@ pub trait ChannelExt {
         exchange: impl AsRef<str>,
         routing_key: impl AsRef<str>,
         event: E,
-    ) -> impl Future<Output = Result<(), Error>>
+    ) -> impl Future<Output = Result<PublisherConfirm, Error>>
     where
         E: Encode;
 
@@ -42,7 +43,7 @@ pub trait ChannelExt {
         options: BasicPublishOptions,
         properties: BasicProperties,
         event: E,
-    ) -> impl Future<Output = Result<(), Error>>
+    ) -> impl Future<Output = Result<PublisherConfirm, Error>>
     where
         E: Encode;
 }
@@ -53,7 +54,7 @@ impl ChannelExt for lapin::Channel {
         exchange: impl AsRef<str>,
         routing_key: impl AsRef<str>,
         event: E,
-    ) -> Result<(), Error>
+    ) -> Result<PublisherConfirm, Error>
     where
         E: Encode,
     {
@@ -90,14 +91,15 @@ impl ChannelExt for lapin::Channel {
                 Default::default(),
             )
             .await?;
-        self.publish_with_options(
-            exchange,
-            routing_key,
-            Default::default(),
-            BasicProperties::default().with_reply_to(DIRECT_REPLY_TO_QUEUE.into()),
-            event,
-        )
-        .await?;
+        let _confirmation = self
+            .publish_with_options(
+                exchange,
+                routing_key,
+                Default::default(),
+                BasicProperties::default().with_reply_to(DIRECT_REPLY_TO_QUEUE.into()),
+                event,
+            )
+            .await?;
         let fut = async move {
             if let Some(delivery) = consumer.next().await {
                 let delivery = delivery?;
@@ -117,7 +119,7 @@ impl ChannelExt for lapin::Channel {
         options: BasicPublishOptions,
         mut properties: BasicProperties,
         event: E,
-    ) -> Result<(), Error>
+    ) -> Result<PublisherConfirm, Error>
     where
         E: Encode,
     {
@@ -127,14 +129,15 @@ impl ChannelExt for lapin::Channel {
                 properties = properties.with_content_type(content_type.into());
             }
         }
-        self.basic_publish(
-            exchange.as_ref(),
-            routing_key.as_ref(),
-            options,
-            &payload,
-            properties,
-        )
-        .await?;
-        Ok(())
+        let confirm = self
+            .basic_publish(
+                exchange.as_ref(),
+                routing_key.as_ref(),
+                options,
+                &payload,
+                properties,
+            )
+            .await?;
+        Ok(confirm)
     }
 }

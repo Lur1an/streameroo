@@ -11,6 +11,7 @@ pub struct Store(FnvHashMap<TypeId, &'static (dyn Any + Send + Sync)>);
 
 pub struct Context {
     /// The global lapin channel to interact with the broker
+    #[deprecated]
     pub channel: Channel,
     /// A generic data storage for shared instances of types
     pub(crate) data: Store,
@@ -189,6 +190,7 @@ pub trait FromDeliveryContext<'a> {
 #[inline]
 pub fn create_delivery_context(
     delivery: Delivery,
+    channel: Channel,
     context: Arc<Context>,
 ) -> (DeliveryContext, Vec<u8>) {
     (
