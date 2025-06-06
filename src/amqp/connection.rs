@@ -1,6 +1,6 @@
 use super::{ChannelExt, Error};
 use crate::event::Decode;
-use lapin::options::BasicConsumeOptions;
+use lapin::options::{BasicConsumeOptions, BasicQosOptions, QueueDeclareOptions};
 use lapin::publisher_confirm::PublisherConfirm;
 use lapin::types::FieldTable;
 use lapin::Error::InvalidConnectionState;
@@ -16,7 +16,8 @@ pub struct AMQPConnection(Arc<Inner>);
 struct Inner {
     connection: Mutex<Connection>,
     /// Main channel for publishing. This is used by the `ChannelExt` impl on `AMQPConnection`
-    /// Avoids `create_channel` spam calls for normal publishing
+    /// Avoids `create_channel` spam calls for normal publishing, allows implementing `ChannelExt`
+    /// on `AMQPConnection`.
     channel: RwLock<Channel>,
     url: String,
 }
@@ -33,17 +34,38 @@ impl AMQPConnection {
         })))
     }
 
+    pub async fn queue_declare(
+        &self,
+        queue: impl AsRef<str>,
+        options: QueueDeclareOptions,
+        arguments: FieldTable,
+    ) -> lapin::Result<lapin::Queue> {
+        self.0
+            .channel
+            .read()
+            .await
+            .queue_declare(queue.as_ref(), options, arguments)
+            .await
+    }
+
     pub async fn create_consumer(
         &self,
         queue: &str,
         consumer_tag: &str,
         options: BasicConsumeOptions,
         arguments: FieldTable,
-    ) -> lapin::Result<Consumer> {
+        prefetch_count: u16,
+    ) -> lapin::Result<(Consumer, Channel)> {
         let channel = self.create_channel().await?;
         channel
-            .basic_consume(queue, consumer_tag, options, arguments)
-            .await
+            .basic_qos(prefetch_count, BasicQosOptions::default())
+            .await?;
+        Ok((
+            channel
+                .basic_consume(queue, consumer_tag, options, arguments)
+                .await?,
+            channel,
+        ))
     }
 
     pub async fn create_channel(&self) -> lapin::Result<Channel> {

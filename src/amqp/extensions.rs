@@ -48,7 +48,8 @@ mod test {
     #[test_context(AMQPTest)]
     #[tokio::test]
     async fn test_field_table_quorum(ctx: &mut AMQPTest) -> anyhow::Result<()> {
-        ctx.channel
+        let channel = ctx.connection.create_channel().await?;
+        channel
             .queue_declare(
                 "test",
                 QueueDeclareOptions {
@@ -61,7 +62,7 @@ mod test {
                 ),
             )
             .await?;
-        ctx.channel
+        channel
             .queue_delete("test", QueueDeleteOptions::default())
             .await?;
         Ok(())

@@ -10,9 +10,6 @@ use std::sync::Arc;
 pub struct Store(FnvHashMap<TypeId, &'static (dyn Any + Send + Sync)>);
 
 pub struct Context {
-    /// The global lapin channel to interact with the broker
-    #[deprecated]
-    pub channel: Channel,
     /// A generic data storage for shared instances of types
     pub(crate) data: Store,
 }
@@ -48,9 +45,8 @@ amqp_wrapper!(DeliveryTag, u64);
 amqp_wrapper!(Redelivered, bool);
 
 impl Context {
-    pub fn new(channel: Channel) -> Self {
+    pub fn new() -> Self {
         Self {
-            channel,
             data: Store(FnvHashMap::default()),
         }
     }
@@ -76,6 +72,7 @@ impl Context {
 pub struct DeliveryContext {
     /// Reference to the global context
     pub(crate) global: Arc<Context>,
+    pub(crate) channel: Channel,
     pub(crate) delivery_tag: lapin::types::DeliveryTag,
     pub(crate) exchange: ShortString,
     pub(crate) routing_key: ShortString,
@@ -179,7 +176,7 @@ impl FromDeliveryContext<'_> for Redelivered {
 
 impl FromDeliveryContext<'_> for Channel {
     fn from_delivery_context(context: &DeliveryContext) -> Self {
-        context.global.channel.clone()
+        context.channel.clone()
     }
 }
 
@@ -195,6 +192,7 @@ pub fn create_delivery_context(
 ) -> (DeliveryContext, Vec<u8>) {
     (
         DeliveryContext {
+            channel,
             global: context,
             delivery_tag: delivery.delivery_tag,
             exchange: delivery.exchange,

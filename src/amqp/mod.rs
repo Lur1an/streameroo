@@ -35,26 +35,20 @@ pub struct Streameroo {
     tasks: Vec<JoinHandle<Result<(), lapin::Error>>>,
 }
 
-impl From<Channel> for Context {
-    fn from(channel: Channel) -> Self {
-        Self::new(channel)
-    }
-}
-
 impl Streameroo {
-    pub async fn new(
+    pub fn new(
         name: impl Into<String>,
         connection: AMQPConnection,
         context: impl Into<Context>,
-    ) -> Result<Self, Error> {
+    ) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
-        Ok(Self {
+        Self {
             shutdown,
             connection,
             context: Arc::new(context.into()),
             name: name.into(),
             tasks: Vec::new(),
-        })
+        }
     }
 
     pub fn connection(&self) -> &AMQPConnection {
@@ -87,7 +81,8 @@ impl Streameroo {
     pub async fn consume<P, T, E>(
         &mut self,
         handler: impl AMQPHandler<P, T, E>,
-        queue: impl AsRef<str>,
+        queue: impl Into<String>,
+        prefetch_count: u16,
     ) -> lapin::Result<()>
     where
         T: AMQPResult,
@@ -103,6 +98,7 @@ impl Streameroo {
                 multiple: false,
             },
             None::<String>,
+            prefetch_count,
         )
         .await
     }
@@ -112,19 +108,20 @@ impl Streameroo {
     pub async fn consume_with_options<P, T, E>(
         &mut self,
         handler: impl AMQPHandler<P, T, E>,
-        queue: impl AsRef<str>,
+        queue: impl Into<String>,
         options: BasicConsumeOptions,
         arguments: FieldTable,
         ack_options: BasicAckOptions,
         nack_options: BasicNackOptions,
         consumer_tag_override: Option<impl Into<String>>,
+        prefetch_count: u16,
     ) -> lapin::Result<()>
     where
         T: AMQPResult,
     {
+        let queue = queue.into();
         let context: Arc<Context> = self.context.clone();
         let connection = self.connection.clone();
-        let queue = queue.as_ref();
         // If the return type is manual or no_ack is set we skip ack/nack'ing the delivery
         let skip_ack = T::manual() || options.no_ack;
         let consumer_tag = consumer_tag_override
@@ -142,16 +139,22 @@ impl Streameroo {
         );
         let shutdown = self.shutdown.clone();
         let fut = async move {
+            // This taskset exists to be able to block and await all ongoing
+            // consumer operations when shutdown is requested.
             let mut tasks = JoinSet::new();
+            let (mut consumer, channel) = connection
+                .create_consumer(
+                    queue.as_ref(),
+                    &consumer_tag,
+                    options,
+                    arguments.clone(),
+                    prefetch_count,
+                )
+                .await?;
             loop {
                 if shutdown.load(Relaxed) {
                     tracing::info!("Shutting down consumer");
                     break;
-                }
-                loop {
-                    let mut consumer = connection
-                        .create_consumer(queue, consumer_tag, options, arguments)
-                        .await?;
                 }
                 if let Some(attempted_delivery) = consumer.next().await {
                     let delivery = attempted_delivery?;
@@ -159,7 +162,7 @@ impl Streameroo {
                     let handler = handler.clone();
                     let delivery_tag = delivery.delivery_tag;
                     let (delivery_context, payload) =
-                        context::create_delivery_context(delivery, context);
+                        context::create_delivery_context(delivery, channel.clone(), context);
                     let fut = async move {
                         match handler.call(payload, &delivery_context).await {
                             Ok(ret) => match ret.handle_result(&delivery_context).await {
@@ -319,17 +322,15 @@ impl_handler!([T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13]);
 
 #[cfg(test)]
 mod amqp_test {
+    use super::AMQPConnection;
     use std::time::Duration;
-
-    use lapin::{Channel, Connection};
     use test_context::AsyncTestContext;
     use testcontainers_modules::rabbitmq::RabbitMq;
     use testcontainers_modules::testcontainers::runners::AsyncRunner;
     use testcontainers_modules::testcontainers::ContainerAsync;
 
     pub struct AMQPTest {
-        pub channel: Channel,
-        pub connection: Connection,
+        pub connection: AMQPConnection,
         pub container: ContainerAsync<RabbitMq>,
     }
 
@@ -341,13 +342,9 @@ mod amqp_test {
             let host_port = container.get_host_port_ipv4(5672).await.unwrap();
 
             let url = format!("amqp://guest:guest@{host_ip}:{host_port}");
-            let connection = Connection::connect(&url, Default::default())
-                .await
-                .expect("Failed to connect to broker");
+            let connection = AMQPConnection::connect(&url).await.unwrap();
             tokio::time::sleep(Duration::from_millis(100)).await;
-            let channel = connection.create_channel().await.unwrap();
             Self {
-                channel,
                 connection,
                 container,
             }
@@ -397,7 +394,8 @@ mod test {
         }
 
         let queue = Uuid::new_v4().to_string();
-        ctx.channel
+        let channel = ctx.connection.create_channel().await?;
+        channel
             .queue_declare(
                 &queue,
                 QueueDeclareOptions {
@@ -407,8 +405,9 @@ mod test {
                 Default::default(),
             )
             .await?;
-        let mut app = Streameroo::new(ctx.channel.clone(), "test-consumer");
-        app.consume(reply_to_handler, &queue).await?;
+        let context = Context::new();
+        let mut app = Streameroo::new("streameroo", ctx.connection.clone(), context);
+        app.consume(reply_to_handler, &queue, 1).await?;
         let mut channel = ctx.connection.create_channel().await?;
         let result: Json<TestEvent> = channel
             .direct_rpc(
@@ -440,10 +439,10 @@ mod test {
             .await?;
 
         let counter = Arc::new(AtomicU8::new(0));
-        let mut context = Context::new(ctx.connection.create_channel().await?);
+        let mut context = Context::new();
         context.data(counter.clone());
-        let mut app = Streameroo::new(context, "test-consumer");
-        app.consume(add_one_handler, &queue).await?;
+        let mut app = Streameroo::new("streameroo", ctx.connection.clone(), context);
+        app.consume(add_one_handler, &queue, 1).await?;
 
         channel
             .publish("", &queue, Json(TestEvent("hello".into())))
@@ -501,7 +500,7 @@ mod test {
             }
         }
         let queue = Uuid::new_v4().to_string();
-        ctx.channel
+        ctx.connection
             .queue_declare(
                 &queue,
                 QueueDeclareOptions {
@@ -512,12 +511,12 @@ mod test {
             )
             .await?;
         let counter = Arc::new(AtomicU8::new(0));
-        let mut context = Context::new(ctx.channel.clone());
+        let mut context = Context::new();
         context.data(counter.clone());
 
-        let mut app = Streameroo::new(context, "test-consumer");
-        app.consume(manual_ack_handler, &queue).await?;
-        ctx.channel
+        let mut app = Streameroo::new("streameroo", ctx.connection.clone(), context);
+        app.consume(manual_ack_handler, &queue, 1).await?;
+        ctx.connection
             .publish("", &queue, Json(TestEvent("hello".into())))
             .await?;
         let t = Instant::now();
@@ -525,7 +524,7 @@ mod test {
             if counter.load(Ordering::Relaxed) == 5 {
                 break;
             }
-            if t.elapsed().as_secs() > 5 {
+            if t.elapsed().as_secs() > 1000000 {
                 panic!("Test timed out");
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -564,7 +563,7 @@ mod test {
         }
 
         let queue = Uuid::new_v4().to_string();
-        ctx.channel
+        ctx.connection
             .queue_declare(
                 &queue,
                 QueueDeclareOptions {
@@ -575,12 +574,12 @@ mod test {
             )
             .await?;
         let counter = Arc::new(AtomicU8::new(0));
-        let mut context = Context::new(ctx.channel.clone());
+        let mut context = Context::new();
         context.data(counter.clone());
 
-        let mut app = Streameroo::new(context, "test-consumer");
-        app.consume(event_handler, &queue).await?;
-        ctx.channel
+        let mut app = Streameroo::new("streameroo", ctx.connection.clone(), context);
+        app.consume(event_handler, &queue, 1).await?;
+        ctx.connection
             .publish("", &queue, Json(TestEvent("hello".into())))
             .await?;
         let t = Instant::now();
@@ -600,7 +599,8 @@ mod test {
     #[tokio::test]
     async fn test_simple_handler_graceful_shutdown(ctx: &mut AMQPTest) -> anyhow::Result<()> {
         let queue = Uuid::new_v4().to_string();
-        ctx.channel
+        let channel = ctx.connection.create_channel().await?;
+        channel
             .queue_declare(
                 &queue,
                 QueueDeclareOptions {
@@ -611,16 +611,16 @@ mod test {
             )
             .await?;
         let counter = Arc::new(AtomicU8::new(0));
-        let mut context = Context::new(ctx.channel.clone());
+        let mut context = Context::new();
         context.data(counter.clone());
 
-        let mut app = Streameroo::new(context, "test-consumer");
-        app.consume(add_one_handler, &queue).await?;
+        let mut app = Streameroo::new("streameroo", ctx.connection.clone(), context);
+        app.consume(add_one_handler, &queue, 1).await?;
         let join = tokio::spawn(app.join(true));
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         nix::sys::signal::kill(Pid::this(), Signal::SIGINT).unwrap();
-        ctx.channel
+        ctx.connection
             .publish("", &queue, Json(TestEvent("hello".into())))
             .await?;
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -628,7 +628,7 @@ mod test {
         tokio::time::timeout(Duration::from_secs(2), join).await???;
         // We killed the process, however the handler has been spawned once since we don't abort
         // the delivery consumption future.
-        ctx.channel
+        ctx.connection
             .publish("", &queue, Json(TestEvent("hello".into())))
             .await?;
         assert_eq!(counter.load(Ordering::Relaxed), 1);

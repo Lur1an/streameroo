@@ -79,7 +79,6 @@ where
 {
     async fn handle_result(self, context: &DeliveryContext) -> Result<(), Error> {
         context
-            .global
             .channel
             .publish_with_options(
                 self.exchange,
@@ -108,7 +107,6 @@ where
     async fn handle_result(self, context: &DeliveryContext) -> Result<(), Error> {
         if let Some(reply_to) = context.properties.reply_to() {
             context
-                .global
                 .channel
                 .publish("", reply_to.as_str(), self.0)
                 .await?;
