@@ -153,7 +153,7 @@ impl Streameroo {
                 .await?;
             loop {
                 if shutdown.load(Relaxed) {
-                    tracing::info!("Shutting down consumer");
+                    tracing::info!("Shutting down consumer task");
                     break;
                 }
                 if let Some(attempted_delivery) = consumer.next().await {
@@ -191,14 +191,17 @@ impl Streameroo {
                             // Decoding an event failed, this would fail again if we nacked the
                             // delivery, so the framework automatically nacks without requeue.
                             Err(Error::Event(e)) => {
-                                tracing::error!(?e, "Error decoding event");
                                 let nack_options = BasicNackOptions {
                                     requeue: false,
                                     multiple: nack_options.multiple,
                                 };
-                                tracing::info!(?nack_options, "Nacking delivery");
+                                tracing::error!(
+                                    ?e,
+                                    ?nack_options,
+                                    "Error decoding event, nacking delivery"
+                                );
                                 if let Err(e) = delivery_context.acker.nack(nack_options).await {
-                                    tracing::error!(?e, "Error acking delivery");
+                                    tracing::error!(?e, "Error nacking delivery");
                                 }
                             }
                             Err(e) => {

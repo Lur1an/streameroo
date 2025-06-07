@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
 /// A wrapper around a `lapin::Connection`
-/// Allows creating channels from the underlying connection
+/// Allows creating channels from the underlying connection. Automatically handles reconnection
 #[derive(Clone)]
 pub struct AMQPConnection(Arc<Inner>);
 
@@ -48,6 +48,7 @@ impl AMQPConnection {
             .await
     }
 
+    /// Create a new channel and a consumer on top of it. Return both the consumer and the channel
     pub async fn create_consumer(
         &self,
         queue: &str,
@@ -73,8 +74,11 @@ impl AMQPConnection {
         match connection.create_channel().await {
             Ok(channel) => Ok(channel),
             Err(e) => match &e {
-                InvalidConnectionState(connection_state) => match connection_state {
-                    ConnectionState::Closing | ConnectionState::Closed | ConnectionState::Error => {
+                InvalidConnectionState(connection_state) => {
+                    if let ConnectionState::Closing
+                    | ConnectionState::Closed
+                    | ConnectionState::Error = connection_state
+                    {
                         let new_connection =
                             Connection::connect(&self.0.url, ConnectionProperties::default())
                                 .await?;
@@ -85,9 +89,10 @@ impl AMQPConnection {
                             *guard = new_channel;
                         };
                         Ok(connection.create_channel().await?)
+                    } else {
+                        Err(e)
                     }
-                    _ => Err(e),
-                },
+                }
                 _ => Err(e),
             },
         }
