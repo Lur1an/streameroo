@@ -96,7 +96,7 @@ impl ChannelExt for amqprs::channel::Channel {
                 )
                 .map_err(|e| Error::Event(e.into()))
             } else {
-                Err(Error::StreamClosed)
+                todo!()
             }
         };
         tokio::time::timeout(timeout, fut).await?

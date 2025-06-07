@@ -1,10 +1,13 @@
 mod auto;
 mod channel;
+mod connection;
 mod context;
 mod handler;
 mod result;
 
 pub use amqprs;
+use amqprs::channel::BasicConsumeArguments;
+use amqprs::BasicProperties;
 pub use auto::*;
 pub use channel::*;
 pub use context::*;
@@ -26,8 +29,6 @@ pub enum Error {
     Handler(BoxError),
     #[error("Event Data error: {0}")]
     Event(BoxError),
-    #[error("Consumer stream closed")]
-    StreamClosed,
     #[error(transparent)]
     Timeout(#[from] tokio::time::error::Elapsed),
     #[error("AMQP error: {0}")]
@@ -79,150 +80,136 @@ impl Streameroo {
         Ok(())
     }
 
-    /// Runs a consumer on the given queue with default options
-    /// - acks all successful deliveries with `multiple: false`
-    /// - nacks all failed deliveries with `requeue: true` and `multiple: false`
-    /// - Default options & fieldtable
-    pub async fn consume<P, T, E>(
-        &mut self,
-        handler: impl AMQPHandler<P, T, E>,
-        queue: impl AsRef<str>,
-    ) -> Result<()>
-    where
-        T: AMQPResult,
-    {
-        self.consume_with_options(
-            handler,
-            queue,
-            Default::default(),
-            Default::default(),
-            BasicAckOptions { multiple: false },
-            BasicNackOptions {
-                requeue: true,
-                multiple: false,
-            },
-            None::<String>,
-        )
-        .await
-    }
-
-    /// Fully configurable queue consuming
-    #[allow(clippy::too_many_arguments)]
-    pub async fn consume_with_options<P, T, E>(
-        &mut self,
-        handler: impl AMQPHandler<P, T, E>,
-        queue: impl AsRef<str>,
-        options: BasicConsumeOptions,
-        arguments: FieldTable,
-        ack_options: BasicAckOptions,
-        nack_options: BasicNackOptions,
-        consumer_tag_override: Option<impl Into<String>>,
-    ) -> Result<()>
-    where
-        T: AMQPResult,
-    {
-        let context: Arc<Context> = self.context.clone();
-        let queue = queue.as_ref();
-        // If the return type is manual or no_ack is set we skip ack/nack'ing the delivery
-        let skip_ack = T::manual() || options.no_ack;
-        let consumer_tag = consumer_tag_override
-            .map(Into::into)
-            .unwrap_or(format!("{}-{}", self.consumer_tag, queue));
-        tracing::info!(
-            queue,
-            consumer_tag,
-            skip_ack,
-            ?options,
-            ?arguments,
-            ?ack_options,
-            ?nack_options,
-            "Starting consumer"
-        );
-        let mut consumer = context
-            .channel
-            .basic_consume(queue, &consumer_tag, options, arguments)
-            .await?;
-        let shutdown = self.shutdown.clone();
-        let fut = async move {
-            let mut tasks = JoinSet::new();
-            loop {
-                if shutdown.load(Relaxed) {
-                    tracing::info!("Shutting down consumer");
-                    break;
-                }
-                if let Some(attempted_delivery) = consumer.next().await {
-                    let delivery = attempted_delivery?;
-                    let context = context.clone();
-                    let handler = handler.clone();
-                    let delivery_tag = delivery.delivery_tag;
-                    let fut = async move {
-                        let (delivery_context, payload) =
-                            context::create_delivery_context(delivery, context);
-                        match handler.call(payload, &delivery_context).await {
-                            Ok(ret) => match ret.handle_result(&delivery_context).await {
-                                Ok(_) => {
-                                    // On manual AMQPResult don't ack the result handling
-                                    if skip_ack {
-                                        return;
-                                    }
-                                    tracing::info!(?ack_options, "Acking delivery");
-                                    if let Err(e) = delivery_context.acker.ack(ack_options).await {
-                                        tracing::error!(?e, "Error acking delivery");
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::error!(?e, "Error processing AMQPResult");
-                                    if skip_ack {
-                                        return;
-                                    }
-                                    tracing::info!(?nack_options, "Nacking delivery");
-                                    if let Err(e) = delivery_context.acker.nack(nack_options).await
-                                    {
-                                        tracing::error!(?e, "Error nacking delivery");
-                                    }
-                                }
-                            },
-                            // Decoding an event failed, this would fail again if we nacked the
-                            // delivery, so the framework automatically nacks without requeue.
-                            Err(Error::Event(e)) => {
-                                tracing::error!(?e, "Error decoding event");
-                                let nack_options = BasicNackOptions {
-                                    requeue: false,
-                                    multiple: nack_options.multiple,
-                                };
-                                tracing::info!(?nack_options, "Nacking delivery");
-                                if let Err(e) = delivery_context.acker.nack(nack_options).await {
-                                    tracing::error!(?e, "Error acking delivery");
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!(?e, "Error calling AMQP handler");
-                                if skip_ack {
-                                    return;
-                                }
-                                tracing::info!(?nack_options, "Nacking delivery");
-                                if let Err(e) = delivery_context.acker.nack(nack_options).await {
-                                    tracing::error!(?e, "Error nacking delivery");
-                                }
-                            }
-                        }
-                    };
-                    tasks.spawn(fut.instrument(tracing::span!(
-                        Level::INFO,
-                        "streameroo",
-                        delivery_tag
-                    )));
-                }
-                // Drain the taskset as it might become full otherwise
-                while tasks.try_join_next().is_some() {}
-            }
-            tasks.join_all().await;
-            Ok(())
-        };
-        let task = tokio::spawn(fut);
-        self.tasks.push(task);
-        Ok(())
-    }
+    ///// Runs a consumer on the given queue with default options
+    ///// - acks all successful deliveries with `multiple: false`
+    ///// - nacks all failed deliveries with `requeue: true` and `multiple: false`
+    ///// - Default options & fieldtable
+    //pub async fn consume<P, T, E>(
+    //    &mut self,
+    //    handler: impl AMQPHandler<P, T, E>,
+    //    queue: impl AsRef<str>,
+    //) -> Result<()>
+    //where
+    //    T: AMQPResult,
+    //{
+    //    self.consume_with_options(handler, queue, Default::default(), None::<String>)
+    //        .await
+    //}
+    //
+    ///// Fully configurable queue consuming
+    //#[allow(clippy::too_many_arguments)]
+    //pub async fn consume_with_options<P, T, E>(
+    //    &mut self,
+    //    handler: impl AMQPHandler<P, T, E>,
+    //    queue: impl AsRef<str>,
+    //    options: BasicConsumeArguments,
+    //    consumer_tag_override: Option<impl Into<String>>,
+    //) -> Result<()>
+    //where
+    //    T: AMQPResult,
+    //{
+    //    let context: Arc<Context> = self.context.clone();
+    //    let queue = queue.as_ref();
+    //    // If the return type is manual or no_ack is set we skip ack/nack'ing the delivery
+    //    let skip_ack = T::manual() || options.no_ack;
+    //    let consumer_tag = consumer_tag_override
+    //        .map(Into::into)
+    //        .unwrap_or(format!("{}-{}", self.consumer_tag, queue));
+    //    tracing::info!(
+    //        queue,
+    //        consumer_tag,
+    //        skip_ack,
+    //        ?options,
+    //        ?arguments,
+    //        ?ack_options,
+    //        ?nack_options,
+    //        "Starting consumer"
+    //    );
+    //    let mut consumer = context
+    //        .channel
+    //        .basic_consume(queue, &consumer_tag, options, arguments)
+    //        .await?;
+    //    let shutdown = self.shutdown.clone();
+    //    let fut = async move {
+    //        let mut tasks = JoinSet::new();
+    //        loop {
+    //            if shutdown.load(Relaxed) {
+    //                tracing::info!("Shutting down consumer");
+    //                break;
+    //            }
+    //            if let Some(attempted_delivery) = consumer.next().await {
+    //                let delivery = attempted_delivery?;
+    //                let context = context.clone();
+    //                let handler = handler.clone();
+    //                let delivery_tag = delivery.delivery_tag;
+    //                let fut = async move {
+    //                    let (delivery_context, payload) =
+    //                        context::create_delivery_context(delivery, context);
+    //                    match handler.call(payload, &delivery_context).await {
+    //                        Ok(ret) => match ret.handle_result(&delivery_context).await {
+    //                            Ok(_) => {
+    //                                // On manual AMQPResult don't ack the result handling
+    //                                if skip_ack {
+    //                                    return;
+    //                                }
+    //                                tracing::info!(?ack_options, "Acking delivery");
+    //                                if let Err(e) = delivery_context.acker.ack(ack_options).await {
+    //                                    tracing::error!(?e, "Error acking delivery");
+    //                                }
+    //                            }
+    //                            Err(e) => {
+    //                                tracing::error!(?e, "Error processing AMQPResult");
+    //                                if skip_ack {
+    //                                    return;
+    //                                }
+    //                                tracing::info!(?nack_options, "Nacking delivery");
+    //                                if let Err(e) = delivery_context.acker.nack(nack_options).await
+    //                                {
+    //                                    tracing::error!(?e, "Error nacking delivery");
+    //                                }
+    //                            }
+    //                        },
+    //                        // Decoding an event failed, this would fail again if we nacked the
+    //                        // delivery, so the framework automatically nacks without requeue.
+    //                        Err(Error::Event(e)) => {
+    //                            tracing::error!(?e, "Error decoding event");
+    //                            let nack_options = BasicNackOptions {
+    //                                requeue: false,
+    //                                multiple: nack_options.multiple,
+    //                            };
+    //                            tracing::info!(?nack_options, "Nacking delivery");
+    //                            if let Err(e) = delivery_context.acker.nack(nack_options).await {
+    //                                tracing::error!(?e, "Error acking delivery");
+    //                            }
+    //                        }
+    //                        Err(e) => {
+    //                            tracing::error!(?e, "Error calling AMQP handler");
+    //                            if skip_ack {
+    //                                return;
+    //                            }
+    //                            tracing::info!(?nack_options, "Nacking delivery");
+    //                            if let Err(e) = delivery_context.acker.nack(nack_options).await {
+    //                                tracing::error!(?e, "Error nacking delivery");
+    //                            }
+    //                        }
+    //                    }
+    //                };
+    //                tasks.spawn(fut.instrument(tracing::span!(
+    //                    Level::INFO,
+    //                    "streameroo",
+    //                    delivery_tag
+    //                )));
+    //            }
+    //            // Drain the taskset as it might become full otherwise
+    //            while tasks.try_join_next().is_some() {}
+    //        }
+    //        tasks.join_all().await;
+    //        Ok(())
+    //    };
+    //    let task = tokio::spawn(fut);
+    //    self.tasks.push(task);
+    //    Ok(())
+    //}
 }
 
 //#[cfg(test)]
