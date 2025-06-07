@@ -1,5 +1,5 @@
-use lapin::options::{BasicAckOptions, BasicNackOptions, BasicPublishOptions};
-use lapin::BasicProperties;
+use amqprs::channel::{BasicAckArguments, BasicNackArguments, BasicPublishArguments};
+use amqprs::BasicProperties;
 use std::future::Future;
 
 use crate::amqp::context::DeliveryContext;
@@ -11,7 +11,7 @@ pub struct Publish<E> {
     pub payload: E,
     pub exchange: String,
     pub routing_key: String,
-    pub options: BasicPublishOptions,
+    pub options: BasicPublishArguments,
     pub properties: BasicProperties,
 }
 
@@ -54,13 +54,19 @@ impl AMQPResult for DeliveryAction {
     async fn handle_result(self, context: &DeliveryContext) -> Result<(), Error> {
         match self {
             DeliveryAction::Ack { multiple } => {
-                context.acker.ack(BasicAckOptions { multiple }).await?
+                let args = BasicAckArguments {
+                    delivery_tag: context.delivery_tag,
+                    multiple,
+                };
+                context.channel.basic_ack(args).await?
             }
             DeliveryAction::Nack { requeue, multiple } => {
-                context
-                    .acker
-                    .nack(BasicNackOptions { requeue, multiple })
-                    .await?
+                let args = BasicNackArguments {
+                    delivery_tag: context.delivery_tag,
+                    multiple,
+                    requeue,
+                };
+                context.channel.basic_nack(args).await?
             }
         };
         Ok(())
@@ -78,16 +84,10 @@ where
     E: Encode + Send,
 {
     async fn handle_result(self, context: &DeliveryContext) -> Result<(), Error> {
+        let args = BasicPublishArguments::new(&self.exchange, &self.routing_key);
         context
-            .global
             .channel
-            .publish_with_options(
-                self.exchange,
-                self.routing_key,
-                self.options,
-                self.properties,
-                self.payload,
-            )
+            .publish_with_options(args, self.properties, self.payload)
             .await?;
         Ok(())
     }
@@ -108,7 +108,6 @@ where
     async fn handle_result(self, context: &DeliveryContext) -> Result<(), Error> {
         if let Some(reply_to) = context.properties.reply_to() {
             context
-                .global
                 .channel
                 .publish("", reply_to.as_str(), self.0)
                 .await?;

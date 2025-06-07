@@ -1,8 +1,6 @@
+use amqprs::channel::{Channel, ConsumerMessage};
+use amqprs::{AmqpDeliveryTag, BasicProperties, ShortStr};
 use fnv::FnvHashMap;
-use lapin::acker::Acker;
-use lapin::message::Delivery;
-use lapin::types::ShortString;
-use lapin::{BasicProperties, Channel};
 use std::any::{Any, TypeId};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
@@ -10,8 +8,6 @@ use std::sync::Arc;
 pub struct Store(FnvHashMap<TypeId, &'static (dyn Any + Send + Sync)>);
 
 pub struct Context {
-    /// The global lapin channel to interact with the broker
-    pub channel: Channel,
     /// A generic data storage for shared instances of types
     pub(crate) data: Store,
 }
@@ -47,9 +43,8 @@ amqp_wrapper!(DeliveryTag, u64);
 amqp_wrapper!(Redelivered, bool);
 
 impl Context {
-    pub fn new(channel: Channel) -> Self {
+    pub fn new() -> Self {
         Self {
-            channel,
             data: Store(FnvHashMap::default()),
         }
     }
@@ -75,12 +70,12 @@ impl Context {
 pub struct DeliveryContext {
     /// Reference to the global context
     pub(crate) global: Arc<Context>,
-    pub(crate) delivery_tag: lapin::types::DeliveryTag,
-    pub(crate) exchange: ShortString,
-    pub(crate) routing_key: ShortString,
+    pub(crate) channel: amqprs::channel::Channel,
+    pub(crate) delivery_tag: AmqpDeliveryTag,
+    pub(crate) exchange: String,
+    pub(crate) routing_key: String,
     pub(crate) redelivered: bool,
     pub(crate) properties: BasicProperties,
-    pub(crate) acker: Acker,
 }
 
 pub struct State<T: 'static>(&'static T);
@@ -178,7 +173,7 @@ impl FromDeliveryContext<'_> for Redelivered {
 
 impl FromDeliveryContext<'_> for Channel {
     fn from_delivery_context(context: &DeliveryContext) -> Self {
-        context.global.channel.clone()
+        context.channel.clone()
     }
 }
 
@@ -188,19 +183,27 @@ pub trait FromDeliveryContext<'a> {
 
 #[inline]
 pub fn create_delivery_context(
-    delivery: Delivery,
+    message: ConsumerMessage,
     context: Arc<Context>,
 ) -> (DeliveryContext, Vec<u8>) {
+    let deliver = message
+        .deliver
+        .expect("ConsumerMessage must have deliver according to amqprs spec");
+    let properties = message
+        .basic_properties
+        .expect("ConsumerMessage must have basic_properties according to amqprs spec");
     (
         DeliveryContext {
             global: context,
-            delivery_tag: delivery.delivery_tag,
-            exchange: delivery.exchange,
-            routing_key: delivery.routing_key,
-            redelivered: delivery.redelivered,
-            properties: delivery.properties,
-            acker: delivery.acker,
+            delivery_tag: deliver.delivery_tag(),
+            exchange: deliver.exchange().to_owned(),
+            routing_key: deliver.routing_key().to_owned(),
+            redelivered: deliver.redelivered(),
+            properties,
+            channel: todo!(),
         },
-        delivery.data,
+        message
+            .content
+            .expect("ConsumerMessage must have content according to amqprs spec"),
     )
 }

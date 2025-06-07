@@ -1,9 +1,8 @@
 use std::future::Future;
 use std::time::Duration;
 
-use lapin::options::{BasicConsumeOptions, BasicPublishOptions};
-use lapin::BasicProperties;
-use tokio_stream::StreamExt;
+use amqprs::channel::{BasicConsumeArguments, BasicPublishArguments};
+use amqprs::BasicProperties;
 use uuid::Uuid;
 
 use crate::event::{Decode, Encode};
@@ -37,9 +36,7 @@ pub trait ChannelExt {
 
     fn publish_with_options<E>(
         &self,
-        exchange: impl AsRef<str>,
-        routing_key: impl AsRef<str>,
-        options: BasicPublishOptions,
+        args: BasicPublishArguments,
         properties: BasicProperties,
         event: E,
     ) -> impl Future<Output = Result<(), Error>>
@@ -47,7 +44,7 @@ pub trait ChannelExt {
         E: Encode;
 }
 
-impl ChannelExt for lapin::Channel {
+impl ChannelExt for amqprs::channel::Channel {
     async fn publish<E>(
         &self,
         exchange: impl AsRef<str>,
@@ -58,9 +55,7 @@ impl ChannelExt for lapin::Channel {
         E: Encode,
     {
         self.publish_with_options(
-            exchange,
-            routing_key,
-            Default::default(),
+            BasicPublishArguments::new(exchange.as_ref(), routing_key.as_ref()),
             Default::default(),
             event,
         )
@@ -78,31 +73,28 @@ impl ChannelExt for lapin::Channel {
         E: Encode,
         T: Decode,
     {
-        let consumer_tag = Uuid::new_v4().to_string();
-        let mut consumer = self
-            .basic_consume(
-                DIRECT_REPLY_TO_QUEUE,
-                &consumer_tag,
-                BasicConsumeOptions {
-                    no_ack: true,
-                    ..Default::default()
-                },
-                Default::default(),
-            )
-            .await?;
+        let consumer_tag = format!("streameroo-rpc-{}", Uuid::new_v4());
+        let args = BasicConsumeArguments::new(DIRECT_REPLY_TO_QUEUE, &consumer_tag);
+
+        let (_, mut consumer) = self.basic_consume_rx(args).await?;
+
+        let mut properties = BasicProperties::default();
+        properties.with_reply_to(DIRECT_REPLY_TO_QUEUE);
+
         self.publish_with_options(
-            exchange,
-            routing_key,
-            Default::default(),
-            BasicProperties::default().with_reply_to(DIRECT_REPLY_TO_QUEUE.into()),
+            BasicPublishArguments::new(exchange.as_ref(), routing_key.as_ref()),
+            properties,
             event,
         )
         .await?;
+
         let fut = async move {
-            if let Some(delivery) = consumer.next().await {
-                let delivery = delivery?;
-                let payload = delivery.data;
-                T::decode(payload).map_err(|e| Error::Event(e.into()))
+            if let Some(msg) = consumer.recv().await {
+                T::decode(
+                    msg.content
+                        .expect("ConsumerMessage must have content according to amqprs spec"),
+                )
+                .map_err(|e| Error::Event(e.into()))
             } else {
                 Err(Error::StreamClosed)
             }
@@ -112,9 +104,7 @@ impl ChannelExt for lapin::Channel {
 
     async fn publish_with_options<E>(
         &self,
-        exchange: impl AsRef<str>,
-        routing_key: impl AsRef<str>,
-        options: BasicPublishOptions,
+        args: BasicPublishArguments,
         mut properties: BasicProperties,
         event: E,
     ) -> Result<(), Error>
@@ -124,17 +114,10 @@ impl ChannelExt for lapin::Channel {
         let payload = event.encode().map_err(|e| Error::Event(e.into()))?;
         if properties.content_type().is_none() {
             if let Some(content_type) = E::content_type() {
-                properties = properties.with_content_type(content_type.into());
+                properties.with_content_type(content_type);
             }
         }
-        self.basic_publish(
-            exchange.as_ref(),
-            routing_key.as_ref(),
-            options,
-            &payload,
-            properties,
-        )
-        .await?;
+        self.basic_publish(properties, payload, args).await?;
         Ok(())
     }
 }
