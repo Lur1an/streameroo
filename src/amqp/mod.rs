@@ -213,48 +213,6 @@ impl Streameroo {
 }
 
 //#[cfg(test)]
-//mod amqp_test {
-//    use std::time::Duration;
-//
-//    use lapin::{Channel, Connection};
-//    use test_context::AsyncTestContext;
-//    use testcontainers_modules::rabbitmq::RabbitMq;
-//    use testcontainers_modules::testcontainers::runners::AsyncRunner;
-//    use testcontainers_modules::testcontainers::ContainerAsync;
-//
-//    pub struct AMQPTest {
-//        pub channel: Channel,
-//        pub connection: Connection,
-//        container: ContainerAsync<RabbitMq>,
-//    }
-//
-//    impl AsyncTestContext for AMQPTest {
-//        async fn setup() -> Self {
-//            tracing_subscriber::fmt().init();
-//            let container = RabbitMq::default().start().await.unwrap();
-//            let host_ip = container.get_host().await.unwrap();
-//            let host_port = container.get_host_port_ipv4(5672).await.unwrap();
-//
-//            let url = format!("amqp://guest:guest@{host_ip}:{host_port}");
-//            let connection = Connection::connect(&url, Default::default())
-//                .await
-//                .expect("Failed to connect to broker");
-//            tokio::time::sleep(Duration::from_millis(100)).await;
-//            let channel = connection.create_channel().await.unwrap();
-//            Self {
-//                channel,
-//                connection,
-//                container,
-//            }
-//        }
-//        async fn teardown(self) {
-//            self.channel.close(0, "bye").await.unwrap();
-//            self.container.rm().await.unwrap();
-//        }
-//    }
-//}
-
-//#[cfg(test)]
 //mod test {
 //    use super::*;
 //    use crate::event::Json;

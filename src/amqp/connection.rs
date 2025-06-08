@@ -5,7 +5,6 @@ use amqprs::callbacks::{DefaultChannelCallback, DefaultConnectionCallback};
 use amqprs::channel::{BasicPublishArguments, Channel};
 use amqprs::connection::{Connection, OpenConnectionArguments};
 use amqprs::BasicProperties;
-use test_context::futures::never::Never;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::{self, Sender};
 use tokio::sync::oneshot;
@@ -63,8 +62,8 @@ async fn connection_loop(
                             break;
                         },
                         Err(e) => {
-                            tracing::error!(error = ?e, "Failed to reconnect, waiting 5s before retrying");
-                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            tracing::error!(error = ?e, "Failed to reconnect, waiting 3s before retrying");
+                            tokio::time::sleep(Duration::from_secs(3)).await;
                         },
                     }
                 }
@@ -128,12 +127,92 @@ impl AMQPConnection {
 }
 
 #[cfg(test)]
+mod amqp_test {
+    use super::*;
+    use amqprs::connection::OpenConnectionArguments;
+    use test_context::AsyncTestContext;
+    use testcontainers_modules::rabbitmq::RabbitMq;
+    use testcontainers_modules::testcontainers::core::IntoContainerPort;
+    use testcontainers_modules::testcontainers::runners::AsyncRunner;
+    use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
+
+    pub struct AMQPTest {
+        pub connection: AMQPConnection,
+        pub container: ContainerAsync<RabbitMq>,
+    }
+
+    pub async fn start_rabbitmq(
+        static_port: bool,
+    ) -> (ContainerAsync<RabbitMq>, OpenConnectionArguments) {
+        let container = if static_port {
+            RabbitMq::default()
+                .with_mapped_port(5672, 5672.tcp())
+                .start()
+                .await
+                .unwrap()
+        } else {
+            RabbitMq::default().start().await.unwrap()
+        };
+        let host_ip = container.get_host().await.unwrap();
+        let host_port = container.get_host_port_ipv4(5672).await.unwrap();
+        let args = OpenConnectionArguments::new(&host_ip.to_string(), host_port, "guest", "guest");
+        (container, args)
+    }
+
+    impl AsyncTestContext for AMQPTest {
+        async fn setup() -> Self {
+            tracing_subscriber::fmt().init();
+            let (container, args) = start_rabbitmq(false).await;
+            let connection = AMQPConnection::connect(args).await.unwrap();
+            AMQPTest {
+                connection,
+                container,
+            }
+        }
+        async fn teardown(self) {
+            self.container.rm().await.unwrap();
+        }
+    }
+}
+
+#[cfg(test)]
 mod test {
     use super::*;
-
+    use amqp_test::AMQPTest;
+    use test_context::test_context;
     use testcontainers_modules::rabbitmq::RabbitMq;
     use testcontainers_modules::testcontainers::runners::AsyncRunner;
     use testcontainers_modules::testcontainers::ContainerAsync;
+
+    #[tokio::test]
+    async fn test_reconnect() -> anyhow::Result<()> {
+        tracing_subscriber::fmt().init();
+        let (container, args) = amqp_test::start_rabbitmq(true).await;
+        let connection = AMQPConnection::connect(args).await?;
+
+        let channel = connection.open_channel().await?;
+        assert!(channel.is_open());
+
+        container.stop().await?;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(!channel.is_open());
+
+        container.start().await?;
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        let channel = connection.open_channel().await?;
+        assert!(channel.is_open());
+
+        container.rm().await?;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(!channel.is_open());
+
+        let (_container, _) = amqp_test::start_rabbitmq(true).await;
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        let channel = connection.open_channel().await?;
+        assert!(channel.is_open());
+
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_playground() {
