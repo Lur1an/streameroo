@@ -53,6 +53,7 @@ async fn connection_loop(
         tokio::select! {
             biased;
             server_disconnected = connection.listen_network_io_failure() => {
+                tokio::time::sleep(Duration::from_secs(3)).await;
                 tracing::info!(server_disconnected, "Detected network io failure, reconnecting");
                 loop {
                     match default_connect(&arguments).await {
@@ -63,7 +64,6 @@ async fn connection_loop(
                         },
                         Err(e) => {
                             tracing::error!(error = ?e, "Failed to reconnect, waiting 3s before retrying");
-                            tokio::time::sleep(Duration::from_secs(3)).await;
                         },
                     }
                 }
@@ -127,7 +127,7 @@ impl AMQPConnection {
 }
 
 #[cfg(test)]
-mod amqp_test {
+pub(crate) mod amqp_test {
     use super::*;
     use amqprs::connection::OpenConnectionArguments;
     use test_context::AsyncTestContext;

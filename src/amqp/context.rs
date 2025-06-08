@@ -184,7 +184,8 @@ pub trait FromDeliveryContext<'a> {
 #[inline]
 pub fn create_delivery_context(
     message: ConsumerMessage,
-    context: Arc<Context>,
+    context: &Arc<Context>,
+    channel: &Channel,
 ) -> (DeliveryContext, Vec<u8>) {
     let deliver = message
         .deliver
@@ -194,13 +195,13 @@ pub fn create_delivery_context(
         .expect("ConsumerMessage must have basic_properties according to amqprs spec");
     (
         DeliveryContext {
-            global: context,
+            global: context.clone(),
             delivery_tag: deliver.delivery_tag(),
             exchange: deliver.exchange().to_owned(),
             routing_key: deliver.routing_key().to_owned(),
             redelivered: deliver.redelivered(),
             properties,
-            channel: todo!(),
+            channel: channel.clone(),
         },
         message
             .content

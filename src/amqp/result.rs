@@ -30,6 +30,8 @@ impl<E> Publish<E> {
 }
 
 pub trait AMQPResult: Send {
+    /// Indicates if this result's `handle_result` implementation takes care of acking/nacking the
+    /// delivery.
     fn manual() -> bool {
         false
     }
@@ -41,7 +43,7 @@ pub trait AMQPResult: Send {
 }
 
 /// Return this type from your handler to have fine-grained control over what happens to the
-/// delivery
+/// delivery after the handler has finished.
 pub enum DeliveryAction {
     Ack { multiple: bool },
     Nack { requeue: bool, multiple: bool },

@@ -74,7 +74,8 @@ impl ChannelExt for amqprs::channel::Channel {
         T: Decode,
     {
         let consumer_tag = format!("streameroo-rpc-{}", Uuid::new_v4());
-        let args = BasicConsumeArguments::new(DIRECT_REPLY_TO_QUEUE, &consumer_tag);
+        let mut args = BasicConsumeArguments::new(DIRECT_REPLY_TO_QUEUE, &consumer_tag);
+        args.manual_ack(false);
 
         let (_, mut consumer) = self.basic_consume_rx(args).await?;
 
