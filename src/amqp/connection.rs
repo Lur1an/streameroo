@@ -49,9 +49,9 @@ async fn connection_loop(
         tokio::select! {
             biased;
             server_disconnected = connection.listen_network_io_failure() => {
-                tokio::time::sleep(Duration::from_secs(3)).await;
                 tracing::info!(server_disconnected, "Detected network io failure, reconnecting");
                 loop {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
                     match default_connect(&arguments).await {
                         Ok(new_connection) => {
                             tracing::info!("Reconnected successfully");
@@ -136,11 +136,11 @@ pub(crate) mod amqp_test {
     }
 
     pub async fn start_rabbitmq(
-        static_port: bool,
+        static_port: Option<u16>,
     ) -> (ContainerAsync<RabbitMq>, OpenConnectionArguments) {
-        let container = if static_port {
+        let container = if let Some(port) = static_port {
             RabbitMq::default()
-                .with_mapped_port(5672, 5672.tcp())
+                .with_mapped_port(port, 5672.tcp())
                 .start()
                 .await
                 .unwrap()
@@ -156,7 +156,7 @@ pub(crate) mod amqp_test {
     impl AsyncTestContext for AMQPTest {
         async fn setup() -> Self {
             tracing_subscriber::fmt().init();
-            let (container, args) = start_rabbitmq(false).await;
+            let (container, args) = start_rabbitmq(None).await;
             let connection = AMQPConnection::connect(args).await.unwrap();
             AMQPTest {
                 connection,
@@ -176,7 +176,7 @@ mod test {
     #[tokio::test]
     async fn test_reconnect() -> anyhow::Result<()> {
         tracing_subscriber::fmt().init();
-        let (container, args) = amqp_test::start_rabbitmq(true).await;
+        let (container, args) = amqp_test::start_rabbitmq(Some(42069)).await;
         let connection = AMQPConnection::connect(args).await?;
 
         let channel = connection.open_channel().await?;
@@ -195,7 +195,7 @@ mod test {
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert!(!channel.is_open());
 
-        let (_container, _) = amqp_test::start_rabbitmq(true).await;
+        let (_container, _) = amqp_test::start_rabbitmq(None).await;
         tokio::time::sleep(Duration::from_secs(6)).await;
         let channel = connection.open_channel().await?;
         assert!(channel.is_open());

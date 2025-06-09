@@ -464,4 +464,64 @@ mod test {
         assert!(success.load(Ordering::Relaxed));
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_consumer_reconnect() -> anyhow::Result<()> {
+        async fn event_handler(
+            counter: StateOwned<Arc<AtomicU8>>,
+            event: Json<TestEvent>,
+        ) -> anyhow::Result<()> {
+            let event = event.into_inner();
+            assert_eq!(event.0, "hello");
+            counter.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        tracing_subscriber::fmt().init();
+        let (container, args) = connection::amqp_test::start_rabbitmq(Some(5672)).await;
+        let connection = AMQPConnection::connect(args).await?;
+
+        let queue = Uuid::new_v4().to_string();
+        let channel = connection.open_channel().await?;
+        channel
+            .queue_declare(QueueDeclareArguments::new(&queue).durable(true).finish())
+            .await?;
+
+        let counter = Arc::new(AtomicU8::new(0));
+        let mut context = Context::new();
+        context.data(counter.clone());
+
+        let mut app = Streameroo::new(connection.clone(), context, "test-consumer");
+        app.consume(event_handler, &queue, 1).await?;
+
+        // Publish first message
+        channel
+            .publish("", &queue, Json(TestEvent("hello".into())))
+            .await?;
+
+        // Wait for first message to be processed
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+
+        // Stop the container
+        container.stop().await?;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // Start the container again
+        container.start().await?;
+        tokio::time::sleep(Duration::from_secs(4)).await;
+
+        // Publish second message after reconnection
+        let channel = connection.open_channel().await?;
+        channel
+            .publish("", &queue, Json(TestEvent("hello".into())))
+            .await?;
+
+        // Wait 5 seconds as requested
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(counter.load(Ordering::Relaxed), 2);
+
+        container.rm().await?;
+        Ok(())
+    }
 }
