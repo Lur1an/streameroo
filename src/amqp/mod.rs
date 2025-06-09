@@ -10,12 +10,12 @@ mod result;
 pub use amqprs;
 pub use auto::*;
 pub use channel::*;
+pub use connection::*;
 pub use context::*;
 pub use extensions::*;
 pub use handler::*;
 pub use result::*;
 
-use self::connection::{AMQPConnection, ConnectionError};
 use self::consumer::Consumer;
 use amqprs::channel::{BasicConsumeArguments, BasicQosArguments};
 use std::sync::Arc;
