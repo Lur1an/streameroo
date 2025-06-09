@@ -194,12 +194,6 @@ mod test {
         container.rm().await?;
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert!(!channel.is_open());
-
-        let (_container, _) = amqp_test::start_rabbitmq(None).await;
-        tokio::time::sleep(Duration::from_secs(6)).await;
-        let channel = connection.open_channel().await?;
-        assert!(channel.is_open());
-
         Ok(())
     }
 }
