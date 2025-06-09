@@ -155,5 +155,8 @@ where
                 while tasks.try_join_next().is_some() {}
             }
         }
+        if let Err(e) = channel.close().await {
+            tracing::error!(?e, "Failed to close channel in consumer");
+        }
     }
 }

@@ -3,6 +3,7 @@ mod channel;
 mod connection;
 mod consumer;
 mod context;
+mod extensions;
 mod handler;
 mod result;
 
@@ -10,12 +11,14 @@ pub use amqprs;
 pub use auto::*;
 pub use channel::*;
 pub use context::*;
+pub use extensions::*;
 pub use handler::*;
 pub use result::*;
 
 use self::connection::{AMQPConnection, ConnectionError};
 use self::consumer::Consumer;
 use amqprs::channel::{BasicConsumeArguments, BasicQosArguments};
+use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
@@ -72,24 +75,40 @@ impl Streameroo {
         &self.connection
     }
 
-    //pub async fn join(self, graceful: bool) -> Result<()> {
-    //    if graceful {
-    //        tokio::spawn({
-    //            async move {
-    //                tokio::signal::ctrl_c()
-    //                    .await
-    //                    .expect("Failed to listen for shutdown signal");
-    //                tracing::info!("Shutdown intercepted, disabling consumers");
-    //                self.shutdown.store(true, Relaxed);
-    //            }
-    //        });
-    //    }
-    //    for task in self.tasks {
-    //        // Tasks should never have a JoinError as we don't interfere with the handles
-    //        task.await.expect("JoinError")?;
-    //    }
-    //    Ok(())
-    //}
+    pub async fn handle_ctrl_c(&mut self) -> &mut Self {
+        let notify = self.shutdown.clone();
+        tokio::spawn({
+            async move {
+                tokio::signal::ctrl_c()
+                    .await
+                    .expect("Failed to listen for shutdown signal");
+                tracing::info!("Shutdown intercepted, disabling consumers");
+                notify.notify_waiters();
+            }
+        });
+        self
+    }
+
+    /// Returns a clone of the `Notify` used to shutdown all active consumers
+    pub fn shutdown_handle(&self) -> Arc<Notify> {
+        self.shutdown.clone()
+    }
+
+    /// Joins all active consumer tasks
+    /// This will block until all tasks have finished, which will only happen if the shutdown
+    /// handle is called or we registered a ctrl-c handler.
+    pub async fn join(&mut self) {
+        for task in self.tasks.drain(..) {
+            match task.await {
+                Ok(result) => {
+                    tracing::info!("Consumer task finished with result: {:?}", result);
+                }
+                Err(e) => {
+                    tracing::error!("JoinError on consumer task: {:?}", e);
+                }
+            }
+        }
+    }
 
     /// Runs a consumer on the given queue with default options
     /// - acks all successful deliveries with `multiple: false`
@@ -100,7 +119,7 @@ impl Streameroo {
         handler: impl AMQPHandler<P, T, E>,
         queue: impl Into<String>,
         consumers: u16,
-    ) -> Result<()>
+    ) -> Result<&mut Self>
     where
         T: AMQPResult + 'static,
         E: Send + 'static,
@@ -115,7 +134,9 @@ impl Streameroo {
             prefetch_count: consumers,
             ..Default::default()
         };
-        self.consume_with_options(handler, options, qos_args).await
+        self.consume_with_options(handler, options, qos_args)
+            .await?;
+        Ok(self)
     }
 
     pub async fn consume_with_options<P, T, E>(
@@ -123,7 +144,7 @@ impl Streameroo {
         handler: impl AMQPHandler<P, T, E>,
         options: BasicConsumeArguments,
         qos_args: BasicQosArguments,
-    ) -> Result<()>
+    ) -> Result<&mut Self>
     where
         T: AMQPResult + 'static,
         E: Send + 'static,
@@ -139,7 +160,7 @@ impl Streameroo {
         );
         let task = tokio::spawn(consumer.consume());
         self.tasks.push(task);
-        Ok(())
+        Ok(self)
     }
 }
 
@@ -160,6 +181,62 @@ mod test {
 
     #[derive(Debug, Serialize, Deserialize)]
     struct TestEvent(String);
+
+    #[test_context(AMQPTest)]
+    #[tokio::test]
+    async fn test_simple_handler(ctx: &mut AMQPTest) -> anyhow::Result<()> {
+        /// This event handler "nacks" messages whilst the count is < 3 after incrementing.
+        /// This lets us assume that it is redelivered when the count is not 0, and fresh otherwise.
+        /// The content of the event needs to be equal to "hello".
+        async fn event_handler(
+            counter: StateOwned<Arc<AtomicU8>>,
+            exchange: Exchange,
+            redelivered: Redelivered,
+            event: Json<TestEvent>,
+        ) -> anyhow::Result<()> {
+            let event = event.into_inner();
+
+            assert_eq!(exchange.into_inner(), "");
+            assert_eq!(event.0, "hello");
+            let count = counter.load(Ordering::Relaxed);
+            tracing::info!(?count);
+            if count == 0 {
+                assert!(!*redelivered);
+            } else {
+                assert!(*redelivered);
+            }
+            if count < 3 {
+                counter.fetch_add(1, Ordering::Relaxed);
+                anyhow::bail!("Go again");
+            }
+            Ok(())
+        }
+        let queue = Uuid::new_v4().to_string();
+        let channel = ctx.connection.open_channel().await?;
+        channel
+            .queue_declare(QueueDeclareArguments::new(&queue))
+            .await?;
+        let counter = Arc::new(AtomicU8::new(0));
+        let mut context = Context::new();
+        context.data(counter.clone());
+
+        let mut app = Streameroo::new(ctx.connection.clone(), context, "test-consumer");
+        channel
+            .publish("", &queue, Json(TestEvent("hello".into())))
+            .await?;
+        app.consume(event_handler, &queue, 3).await?;
+        let t = Instant::now();
+        loop {
+            if counter.load(Ordering::Relaxed) == 3 {
+                break;
+            }
+            if t.elapsed().as_secs() > 5 {
+                panic!("Test timed out");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Ok(())
+    }
 
     #[test_context(AMQPTest)]
     #[tokio::test]
@@ -191,164 +268,95 @@ mod test {
         assert_eq!(result.into_inner().0, "world");
         Ok(())
     }
+
+    #[test_context(AMQPTest)]
+    #[tokio::test]
+    async fn test_manual_ack_handler(ctx: &mut AMQPTest) -> anyhow::Result<()> {
+        async fn manual_ack_handler(
+            counter: StateOwned<Arc<AtomicU8>>,
+            event: Json<TestEvent>,
+        ) -> anyhow::Result<DeliveryAction> {
+            let count = counter.load(Ordering::Relaxed);
+            let event = event.into_inner();
+            assert_eq!(event.0, "hello");
+            tracing::info!(?count);
+            if count < 5 {
+                counter.fetch_add(1, Ordering::Relaxed);
+                Ok(DeliveryAction::Nack {
+                    requeue: true,
+                    multiple: false,
+                })
+            } else {
+                Ok(DeliveryAction::Nack {
+                    multiple: false,
+                    requeue: false,
+                })
+            }
+        }
+        let queue = Uuid::new_v4().to_string();
+        let channel = ctx.connection.open_channel().await?;
+        channel
+            .queue_declare(QueueDeclareArguments::new(&queue))
+            .await?;
+        let counter = Arc::new(AtomicU8::new(0));
+        let mut context = Context::new();
+        context.data(counter.clone());
+
+        let mut app = Streameroo::new(ctx.connection.clone(), context, "test-consumer");
+        app.consume(manual_ack_handler, &queue, 1).await?;
+        channel
+            .publish("", &queue, Json(TestEvent("hello".into())))
+            .await?;
+        let t = Instant::now();
+        loop {
+            if counter.load(Ordering::Relaxed) == 5 {
+                break;
+            }
+            if t.elapsed().as_secs() > 5 {
+                panic!("Test timed out");
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        Ok(())
+    }
+
+    //    #[test_context(AMQPTest)]
+    //    #[tokio::test]
+    //    async fn test_simple_handler_graceful_shutdown(ctx: &mut AMQPTest) -> anyhow::Result<()> {
+    //        let queue = Uuid::new_v4().to_string();
+    //        ctx.channel
+    //            .queue_declare(
+    //                &queue,
+    //                QueueDeclareOptions {
+    //                    auto_delete: true,
+    //                    ..Default::default()
+    //                },
+    //                Default::default(),
+    //            )
+    //            .await?;
+    //        let counter = Arc::new(AtomicU8::new(0));
+    //        let mut context = Context::new(ctx.channel.clone());
+    //        context.data(counter.clone());
+    //
+    //        let mut app = Streameroo::new(context, "test-consumer");
+    //        app.consume(event_handler, &queue).await?;
+    //        let join = tokio::spawn(app.join(true));
+    //        tokio::time::sleep(Duration::from_millis(100)).await;
+    //
+    //        nix::sys::signal::kill(Pid::this(), Signal::SIGINT).unwrap();
+    //        ctx.channel
+    //            .publish("", &queue, Json(TestEvent("hello".into())))
+    //            .await?;
+    //        tokio::time::sleep(Duration::from_millis(100)).await;
+    //        // Use timeout as if the signal handling fails `app.join` will never complete
+    //        tokio::time::timeout(Duration::from_secs(2), join).await???;
+    //        // We killed the process, however the handler has been spawned once since we don't abort
+    //        // the delivery consumption future.
+    //        assert_eq!(counter.load(Ordering::Relaxed), 1);
+    //        Ok(())
+    //    }
 }
 //
 //
-//    /// This event handler "nacks" messages whilst the count is < 3 after incrementing.
-//    /// This lets us assume that it is redelivered when the count is not 0, and fresh otherwise.
-//    /// The content of the event needs to be equal to "hello".
-//    async fn event_handler(
-//        counter: StateOwned<Arc<AtomicU8>>,
-//        exchange: Exchange,
-//        redelivered: Redelivered,
-//        event: Json<TestEvent>,
-//    ) -> anyhow::Result<()> {
-//        let event = event.into_inner();
 //
-//        assert_eq!(exchange.into_inner(), "");
-//        assert_eq!(event.0, "hello");
-//        let count = counter.load(Ordering::Relaxed);
-//        tracing::info!(?count);
-//        if count == 0 {
-//            assert!(!*redelivered);
-//        } else {
-//            assert!(*redelivered);
-//        }
-//        if count < 3 {
-//            counter.fetch_add(1, Ordering::Relaxed);
-//            anyhow::bail!("Go again");
-//        }
-//        Ok(())
-//    }
-//
-//    async fn manual_ack_handler(
-//        counter: StateOwned<Arc<AtomicU8>>,
-//        event: Json<TestEvent>,
-//    ) -> Result<DeliveryAction, Infallible> {
-//        let count = counter.load(Ordering::Relaxed);
-//        let event = event.into_inner();
-//        assert_eq!(event.0, "hello");
-//        tracing::info!(?count);
-//        if count < 5 {
-//            counter.fetch_add(1, Ordering::Relaxed);
-//            Ok(DeliveryAction::Nack {
-//                requeue: true,
-//                multiple: false,
-//            })
-//        } else {
-//            Ok(DeliveryAction::Nack {
-//                multiple: false,
-//                requeue: false,
-//            })
-//        }
-//    }
-//
-//
-//    #[test_context(AMQPTest)]
-//    #[tokio::test]
-//    async fn test_manual_ack_handler(ctx: &mut AMQPTest) -> anyhow::Result<()> {
-//        let queue = Uuid::new_v4().to_string();
-//        ctx.channel
-//            .queue_declare(
-//                &queue,
-//                QueueDeclareOptions {
-//                    auto_delete: true,
-//                    ..Default::default()
-//                },
-//                Default::default(),
-//            )
-//            .await?;
-//        let counter = Arc::new(AtomicU8::new(0));
-//        let mut context = Context::new(ctx.channel.clone());
-//        context.data(counter.clone());
-//
-//        let mut app = Streameroo::new(context, "test-consumer");
-//        app.consume(manual_ack_handler, &queue).await?;
-//        ctx.channel
-//            .publish("", &queue, Json(TestEvent("hello".into())))
-//            .await?;
-//        let t = Instant::now();
-//        loop {
-//            if counter.load(Ordering::Relaxed) == 5 {
-//                break;
-//            }
-//            if t.elapsed().as_secs() > 5 {
-//                panic!("Test timed out");
-//            }
-//            tokio::time::sleep(Duration::from_millis(500)).await;
-//        }
-//        Ok(())
-//    }
-//
-//    #[test_context(AMQPTest)]
-//    #[tokio::test]
-//    async fn test_simple_handler(ctx: &mut AMQPTest) -> anyhow::Result<()> {
-//        let queue = Uuid::new_v4().to_string();
-//        ctx.channel
-//            .queue_declare(
-//                &queue,
-//                QueueDeclareOptions {
-//                    auto_delete: true,
-//                    ..Default::default()
-//                },
-//                Default::default(),
-//            )
-//            .await?;
-//        let counter = Arc::new(AtomicU8::new(0));
-//        let mut context = Context::new(ctx.channel.clone());
-//        context.data(counter.clone());
-//
-//        let mut app = Streameroo::new(context, "test-consumer");
-//        app.consume(event_handler, &queue).await?;
-//        ctx.channel
-//            .publish("", &queue, Json(TestEvent("hello".into())))
-//            .await?;
-//        let t = Instant::now();
-//        loop {
-//            if counter.load(Ordering::Relaxed) == 3 {
-//                break;
-//            }
-//            if t.elapsed().as_secs() > 5 {
-//                panic!("Test timed out");
-//            }
-//            tokio::time::sleep(Duration::from_millis(100)).await;
-//        }
-//        Ok(())
-//    }
-//
-//    #[test_context(AMQPTest)]
-//    #[tokio::test]
-//    async fn test_simple_handler_graceful_shutdown(ctx: &mut AMQPTest) -> anyhow::Result<()> {
-//        let queue = Uuid::new_v4().to_string();
-//        ctx.channel
-//            .queue_declare(
-//                &queue,
-//                QueueDeclareOptions {
-//                    auto_delete: true,
-//                    ..Default::default()
-//                },
-//                Default::default(),
-//            )
-//            .await?;
-//        let counter = Arc::new(AtomicU8::new(0));
-//        let mut context = Context::new(ctx.channel.clone());
-//        context.data(counter.clone());
-//
-//        let mut app = Streameroo::new(context, "test-consumer");
-//        app.consume(event_handler, &queue).await?;
-//        let join = tokio::spawn(app.join(true));
-//        tokio::time::sleep(Duration::from_millis(100)).await;
-//
-//        nix::sys::signal::kill(Pid::this(), Signal::SIGINT).unwrap();
-//        ctx.channel
-//            .publish("", &queue, Json(TestEvent("hello".into())))
-//            .await?;
-//        tokio::time::sleep(Duration::from_millis(100)).await;
-//        // Use timeout as if the signal handling fails `app.join` will never complete
-//        tokio::time::timeout(Duration::from_secs(2), join).await???;
-//        // We killed the process, however the handler has been spawned once since we don't abort
-//        // the delivery consumption future.
-//        assert_eq!(counter.load(Ordering::Relaxed), 1);
-//        Ok(())
-//    }
 //}

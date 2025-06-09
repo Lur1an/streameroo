@@ -1,12 +1,8 @@
-use std::future::Future;
-use std::time::Duration;
-
 use amqprs::callbacks::{DefaultChannelCallback, DefaultConnectionCallback};
-use amqprs::channel::{BasicPublishArguments, Channel};
+use amqprs::channel::Channel;
 use amqprs::connection::{Connection, OpenConnectionArguments};
-use amqprs::BasicProperties;
-use tokio::runtime::Handle;
-use tokio::sync::mpsc::{self, Sender};
+use std::time::Duration;
+use tokio::sync::mpsc::{self};
 use tokio::sync::oneshot;
 use tokio::time::error::Elapsed;
 
@@ -122,8 +118,6 @@ impl AMQPConnection {
         };
         Ok(tokio::time::timeout(self.rpc_timeout, fut).await???)
     }
-
-    async fn rpc(&self, req: AMQPRpc) {}
 }
 
 #[cfg(test)]
