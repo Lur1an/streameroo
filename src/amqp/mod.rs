@@ -221,7 +221,7 @@ mod test {
         context.data(counter.clone());
 
         let mut app = Streameroo::new(ctx.connection.clone(), context, "test-consumer");
-        channel
+        ctx.connection
             .publish("", &queue, Json(TestEvent("hello".into())))
             .await?;
         app.consume(event_handler, &queue, 3).await?;
@@ -298,7 +298,7 @@ mod test {
             )
             .await
             .ok();
-        channel
+        ctx.connection
             .publish("", &queue, Json(TestEvent("hello".into())))
             .await?;
         let counter = Arc::new(AtomicU8::new(0));
@@ -347,7 +347,7 @@ mod test {
 
         let mut app = Streameroo::new(ctx.connection.clone(), context, "test-consumer");
         app.consume(manual_ack_handler, &queue, 1).await?;
-        channel
+        ctx.connection
             .publish("", &queue, Json(TestEvent("hello".into())))
             .await?;
         let t = Instant::now();
@@ -389,12 +389,12 @@ mod test {
         app.consume(event_handler, &queue, 1).await?;
         let join = tokio::spawn(async move { app.handle_ctrl_c().join().await });
         tokio::time::sleep(Duration::from_millis(100)).await;
-        channel
+        ctx.connection
             .publish("", &queue, Json(TestEvent("hello".into())))
             .await?;
         tokio::time::sleep(Duration::from_millis(100)).await;
         nix::sys::signal::kill(Pid::this(), Signal::SIGINT).unwrap();
-        channel
+        ctx.connection
             .publish("", &queue, Json(TestEvent("hello".into())))
             .await?;
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -495,7 +495,7 @@ mod test {
         app.consume(event_handler, &queue, 1).await?;
 
         // Publish first message
-        channel
+        connection
             .publish("", &queue, Json(TestEvent("hello".into())))
             .await?;
 
@@ -512,8 +512,7 @@ mod test {
         tokio::time::sleep(Duration::from_secs(4)).await;
 
         // Publish second message after reconnection
-        let channel = connection.open_channel().await?;
-        channel
+        connection
             .publish("", &queue, Json(TestEvent("hello".into())))
             .await?;
 

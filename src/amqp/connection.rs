@@ -1,6 +1,9 @@
+use super::Error;
+use crate::event::Encode;
 use amqprs::callbacks::{DefaultChannelCallback, DefaultConnectionCallback};
-use amqprs::channel::Channel;
+use amqprs::channel::{BasicPublishArguments, Channel};
 use amqprs::connection::{Connection, OpenConnectionArguments};
+use amqprs::BasicProperties;
 use std::time::Duration;
 use tokio::sync::mpsc::{self};
 use tokio::sync::oneshot;
@@ -12,14 +15,23 @@ pub enum ConnectionError {
     Amqp(#[from] amqprs::error::Error),
     #[error("Timed out waiting for response from loop: {0}")]
     Timeout(#[from] Elapsed),
-    #[error("Send error, io loop faulty: {0}")]
-    LoopTx(#[from] mpsc::error::SendError<AMQPRpc>),
+    #[error("Send error, io loop faulty")]
+    LoopTx,
     #[error("Rpc sender dropped: {0}")]
     RpcRecv(#[from] oneshot::error::RecvError),
 }
 
-pub enum AMQPRpc {
+struct Publish {
+    tx: oneshot::Sender<Result<(), amqprs::error::Error>>,
+    data: Vec<u8>,
+    properties: BasicProperties,
+    args: BasicPublishArguments,
+}
+
+#[allow(dead_code)]
+enum AMQPRpc {
     OpenChannel(oneshot::Sender<Result<Channel, amqprs::error::Error>>),
+    Publish(Box<Publish>),
     Close,
 }
 
@@ -42,8 +54,11 @@ async fn default_connect(
 async fn connection_loop(
     mut rx: mpsc::Receiver<AMQPRpc>,
     mut connection: Connection,
+    mut pool: Vec<Channel>,
     arguments: OpenConnectionArguments,
 ) {
+    let pool_size = pool.len();
+    let mut pool_idx = 0;
     loop {
         // The bias makes sure the `listen_network_io_failure` future is polled first
         tokio::select! {
@@ -54,8 +69,15 @@ async fn connection_loop(
                     tokio::time::sleep(Duration::from_secs(3)).await;
                     match default_connect(&arguments).await {
                         Ok(new_connection) => {
-                            tracing::info!("Reconnected successfully");
+                            tracing::info!("Reconnected successfully. Discarding old connection & channels, filling up pool with new channels");
                             connection = new_connection;
+                            for pool_slot in &mut pool {
+                                let Ok(channel) = connection.open_channel(None).await else {
+                                    tracing::error!("Failed to open channel after acquiring connection");
+                                    continue;
+                                };
+                                *pool_slot = channel;
+                            }
                             break;
                         },
                         Err(e) => {
@@ -66,6 +88,18 @@ async fn connection_loop(
             }
             rpc = rx.recv() => {
                 match rpc {
+                    Some(AMQPRpc::Publish(rpc)) => {
+                        let channel = pool[pool_idx].clone();
+                        tokio::spawn(async move {
+                            let result = channel.basic_publish(
+                                rpc.properties,
+                                rpc.data,
+                                rpc.args
+                            ).await;
+                            rpc.tx.send(result).ok();
+                        });
+                        pool_idx = (pool_idx + 1) % pool_size;
+                    }
                     Some(AMQPRpc::OpenChannel(tx)) => {
                         tracing::info!("Opening AMQP channel");
                         let channel = connection.open_channel(None).await;
@@ -81,9 +115,7 @@ async fn connection_loop(
                                 Err(e)
                             }
                         };
-                        if tx.send(result).is_err() {
-                            tracing::error!("Error sending response over rpc channel");
-                        }
+                        tx.send(result).ok();
                     }
                     // Both on close and drop close the connection
                     Some(AMQPRpc::Close) | None => {
@@ -106,17 +138,82 @@ impl AMQPConnection {
         let (tx, rx) = mpsc::channel(2000);
         let rpc_timeout = Duration::from_secs(10);
         let connection = default_connect(&arguments).await?;
-        tokio::spawn(connection_loop(rx, connection, arguments));
+        let mut pool: Vec<Channel> = Vec::with_capacity(10);
+        for _ in 0..10 {
+            pool.push(connection.open_channel(None).await?);
+        }
+        tokio::spawn(connection_loop(rx, connection, pool, arguments));
         Ok(Self { tx, rpc_timeout })
     }
 
     pub async fn open_channel(&self) -> Result<Channel, ConnectionError> {
         let (tx, rx) = oneshot::channel();
         let fut = async {
-            self.tx.send(AMQPRpc::OpenChannel(tx)).await?;
+            self.tx
+                .send(AMQPRpc::OpenChannel(tx))
+                .await
+                .map_err(|_| ConnectionError::LoopTx)?;
             Ok::<_, ConnectionError>(rx.await?)
         };
         Ok(tokio::time::timeout(self.rpc_timeout, fut).await???)
+    }
+
+    pub async fn basic_publish(
+        &self,
+        properties: BasicProperties,
+        data: Vec<u8>,
+        args: BasicPublishArguments,
+    ) -> Result<(), ConnectionError> {
+        let (tx, rx) = oneshot::channel();
+        let fut = async {
+            self.tx
+                .send(AMQPRpc::Publish(Box::new(Publish {
+                    tx,
+                    data,
+                    properties,
+                    args,
+                })))
+                .await
+                .map_err(|_| ConnectionError::LoopTx)?;
+            Ok::<_, ConnectionError>(rx.await?)
+        };
+        Ok(tokio::time::timeout(self.rpc_timeout, fut).await???)
+    }
+
+    pub async fn publish<E>(
+        &self,
+        exchange: impl AsRef<str>,
+        routing_key: impl AsRef<str>,
+        event: E,
+    ) -> Result<(), Error>
+    where
+        E: Encode,
+    {
+        self.publish_with_options(
+            BasicPublishArguments::new(exchange.as_ref(), routing_key.as_ref()),
+            Default::default(),
+            event,
+        )
+        .await
+    }
+
+    pub async fn publish_with_options<E>(
+        &self,
+        args: BasicPublishArguments,
+        mut properties: BasicProperties,
+        event: E,
+    ) -> Result<(), Error>
+    where
+        E: Encode,
+    {
+        let payload = event.encode().map_err(|e| Error::Event(e.into()))?;
+        if properties.content_type().is_none() {
+            if let Some(content_type) = E::content_type() {
+                properties.with_content_type(content_type);
+            }
+        }
+        self.basic_publish(properties, payload, args).await?;
+        Ok(())
     }
 }
 
