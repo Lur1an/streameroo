@@ -1,8 +1,6 @@
-use std::ops::{Deref, DerefMut};
-
-use serde::de::DeserializeOwned;
-
 use super::{AMQPDecode, Error};
+use serde::de::DeserializeOwned;
+use std::ops::{Deref, DerefMut};
 
 /// Type to instruct the framework to auto decode the event given its content-type and content-encoding headers
 /// with a serde-compatible deserializer.

@@ -1,17 +1,17 @@
-use lapin::types::AMQPValue;
+use amqprs::FieldValue;
 
 #[macro_export]
 macro_rules! field_table {
      () => {
-         $crate::amqp::lapin::types::FieldTable::default()
+         $crate::amqp::amqprs::FieldTable::default()
      };
 
      ($(($key:expr, $value:expr)),* $(,)?) => {{
-         let mut field_table = $crate::amqp::lapin::types::FieldTable::default();
+         let mut field_table = $crate::amqp::amqprs::FieldTable::default();
          $(
              field_table.insert(
-                 $crate::amqp::lapin::types::ShortString::from($key),
-                 $crate::amqp::lapin::types::AMQPValue::from($value)
+                 $crate::amqp::amqprs::FieldName::try_from($key).unwrap(),
+                 $crate::amqp::amqprs::FieldValue::from($value)
              );
          )*
          field_table
@@ -24,46 +24,38 @@ pub enum XQueueType {
     Stream,
 }
 
-impl From<XQueueType> for AMQPValue {
+impl From<XQueueType> for FieldValue {
     fn from(x: XQueueType) -> Self {
         match x {
-            XQueueType::Classic => AMQPValue::LongString("classic".into()),
-            XQueueType::Quorum => AMQPValue::LongString("quorum".into()),
-            XQueueType::Stream => AMQPValue::LongString("stream".into()),
+            XQueueType::Classic => FieldValue::from("classic"),
+            XQueueType::Quorum => FieldValue::from("quorum"),
+            XQueueType::Stream => FieldValue::from("stream"),
         }
     }
 }
 
 #[cfg(test)]
 mod test {
-    use lapin::options::{QueueDeclareOptions, QueueDeleteOptions};
-    use lapin::types::{FieldTable, ShortString};
-    use std::collections::BTreeMap;
-    use test_context::test_context;
-
-    use crate::amqp::amqp_test::AMQPTest;
-
     use super::*;
+    use crate::amqp::connection::amqp_test::AMQPTest;
+    use amqprs::channel::QueueDeclareArguments;
+    use amqprs::{FieldName, FieldTable};
+    use test_context::test_context;
 
     #[test_context(AMQPTest)]
     #[tokio::test]
     async fn test_field_table_quorum(ctx: &mut AMQPTest) -> anyhow::Result<()> {
-        ctx.channel
-            .queue_declare(
-                "test",
-                QueueDeclareOptions {
-                    durable: true,
-                    ..Default::default()
-                },
-                field_table!(
-                    ("x-queue-type", XQueueType::Quorum),
-                    ("x-delivery-limit", 6)
-                ),
-            )
-            .await?;
-        ctx.channel
-            .queue_delete("test", QueueDeleteOptions::default())
-            .await?;
+        let channel = ctx.connection.open_channel().await?;
+        let mut options = QueueDeclareArguments::default();
+        options
+            .queue("queue".to_owned())
+            .durable(true)
+            .arguments(field_table!(
+                ("x-queue-type", XQueueType::Quorum),
+                ("x-delivery-limit", FieldValue::u(6)),
+            ));
+        let queue = channel.queue_declare(options).await?.unwrap();
+        assert_eq!(queue.0, "queue");
         Ok(())
     }
 
@@ -71,15 +63,17 @@ mod test {
     fn test_field_table() {
         let table = field_table!(
             ("x-queue-type", XQueueType::Quorum),
-            ("x-delivery-limit", 6)
+            ("x-delivery-limit", FieldValue::u(6))
         );
-        let expected = FieldTable::from(BTreeMap::from([
-            (
-                ShortString::from("x-queue-type"),
-                AMQPValue::LongString("quorum".into()),
-            ),
-            (ShortString::from("x-delivery-limit"), AMQPValue::from(6)),
-        ]));
+        let mut expected = FieldTable::default();
+        expected.insert(
+            FieldName::try_from("x-queue-type").unwrap(),
+            FieldValue::from("quorum"),
+        );
+        expected.insert(
+            FieldName::try_from("x-delivery-limit").unwrap(),
+            FieldValue::u(6),
+        );
         assert_eq!(table, expected);
     }
 }
