@@ -1,5 +1,5 @@
 use amqprs::channel::{Channel, ConsumerMessage};
-use amqprs::{AmqpDeliveryTag, BasicProperties, ShortStr};
+use amqprs::{AmqpDeliveryTag, BasicProperties};
 use fnv::FnvHashMap;
 use std::any::{Any, TypeId};
 use std::ops::{Deref, DerefMut};
@@ -41,6 +41,12 @@ amqp_wrapper!(Exchange, String);
 amqp_wrapper!(ReplyTo, Option<String>);
 amqp_wrapper!(DeliveryTag, u64);
 amqp_wrapper!(Redelivered, bool);
+
+impl Default for Context {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Context {
     pub fn new() -> Self {

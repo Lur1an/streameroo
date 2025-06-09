@@ -18,7 +18,6 @@ pub use result::*;
 use self::connection::{AMQPConnection, ConnectionError};
 use self::consumer::Consumer;
 use amqprs::channel::{BasicConsumeArguments, BasicQosArguments};
-use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
@@ -168,7 +167,9 @@ impl Streameroo {
 mod test {
     use super::*;
     use crate::event::Json;
+    use crate::field_table;
     use amqprs::channel::QueueDeclareArguments;
+    use amqprs::FieldValue;
     use connection::amqp_test::AMQPTest;
     use nix::sys::signal::Signal;
     use nix::unistd::Pid;
@@ -265,6 +266,49 @@ mod test {
             )
             .await?;
         assert_eq!(result.into_inner().0, "world");
+        Ok(())
+    }
+
+    #[test_context(AMQPTest)]
+    #[tokio::test]
+    async fn test_delivery_limit(ctx: &mut AMQPTest) -> anyhow::Result<()> {
+        async fn event_handler(
+            counter: StateOwned<Arc<AtomicU8>>,
+            event: Json<TestEvent>,
+        ) -> anyhow::Result<()> {
+            let event = event.into_inner();
+            assert_eq!(event.0, "hello");
+            let deliveries = counter.fetch_add(1, Ordering::Relaxed);
+            if deliveries > 6 {
+                panic!("Too many deliveries: {deliveries}")
+            }
+            anyhow::bail!("Go again");
+        }
+        let queue = Uuid::new_v4().to_string();
+        let channel = ctx.connection.open_channel().await?;
+        channel
+            .queue_declare(
+                QueueDeclareArguments::new(&queue)
+                    .durable(true)
+                    .arguments(field_table!(
+                        ("x-queue-type", XQueueType::Quorum),
+                        ("x-delivery-limit", FieldValue::u(5))
+                    ))
+                    .finish(),
+            )
+            .await
+            .ok();
+        channel
+            .publish("", &queue, Json(TestEvent("hello".into())))
+            .await?;
+        let counter = Arc::new(AtomicU8::new(0));
+        let mut context = Context::new();
+        context.data(counter.clone());
+
+        let mut app = Streameroo::new(ctx.connection.clone(), context, "test-consumer");
+        app.consume(event_handler, &queue, 1).await?;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(counter.load(Ordering::Relaxed), 6);
         Ok(())
     }
 

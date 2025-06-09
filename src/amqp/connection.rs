@@ -172,11 +172,6 @@ pub(crate) mod amqp_test {
 #[cfg(test)]
 mod test {
     use super::*;
-    use amqp_test::AMQPTest;
-    use test_context::test_context;
-    use testcontainers_modules::rabbitmq::RabbitMq;
-    use testcontainers_modules::testcontainers::runners::AsyncRunner;
-    use testcontainers_modules::testcontainers::ContainerAsync;
 
     #[tokio::test]
     async fn test_reconnect() -> anyhow::Result<()> {
@@ -206,39 +201,5 @@ mod test {
         assert!(channel.is_open());
 
         Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_playground() {
-        tracing_subscriber::fmt().init();
-        let container = RabbitMq::default().start().await.unwrap();
-        let host_ip = container.get_host().await.unwrap();
-        let host_port = container.get_host_port_ipv4(5672).await.unwrap();
-        let args = OpenConnectionArguments::new(&host_ip.to_string(), host_port, "guest", "guest");
-        let connection = Connection::open(&args).await.unwrap();
-        let channel = connection.open_channel(None).await.unwrap();
-
-        tokio::spawn({
-            let connection = connection.clone();
-            async move {
-                if connection.listen_network_io_failure().await {
-                    tracing::info!(
-                        open = connection.is_open(),
-                        "network io failure. connectoin dropped"
-                    );
-                } else {
-                    tracing::info!(
-                        open = connection.is_open(),
-                        "no network io failure. connection closed by server"
-                    );
-                }
-            }
-        });
-        connection.close().await.unwrap();
-        tracing::info!("Connection closed");
-        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-        container.rm().await.unwrap();
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-        assert!(!channel.is_open());
     }
 }
