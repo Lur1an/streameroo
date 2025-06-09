@@ -168,13 +168,13 @@ mod test {
     use super::*;
     use crate::event::Json;
     use crate::field_table;
-    use amqprs::channel::QueueDeclareArguments;
+    use amqprs::channel::{ExchangeDeclareArguments, QueueBindArguments, QueueDeclareArguments};
     use amqprs::FieldValue;
     use connection::amqp_test::AMQPTest;
     use nix::sys::signal::Signal;
     use nix::unistd::Pid;
     use serde::{Deserialize, Serialize};
-    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
     use std::time::{Duration, Instant};
     use test_context::test_context;
     use uuid::Uuid;
@@ -405,8 +405,63 @@ mod test {
         assert_eq!(counter.load(Ordering::Relaxed), 1);
         Ok(())
     }
+
+    #[test_context(AMQPTest)]
+    #[tokio::test]
+    async fn test_all_amqp_extractors(ctx: &mut AMQPTest) -> anyhow::Result<()> {
+        async fn event_handler(
+            exchange: Exchange,
+            routing_key: RoutingKey,
+            reply_to: ReplyTo,
+            delivery_tag: DeliveryTag,
+            redelivered: Redelivered,
+            success: StateOwned<Arc<AtomicBool>>,
+            event: Json<TestEvent>,
+        ) -> anyhow::Result<()> {
+            let event = event.into_inner();
+            assert_eq!(event.0, "hello");
+            assert_eq!(exchange.into_inner(), "test-exchange");
+            assert_eq!(routing_key.into_inner(), "test.routing.key");
+            assert_eq!(reply_to.into_inner(), None);
+            assert_eq!(delivery_tag.into_inner(), 1);
+            assert!(!redelivered.into_inner());
+            success.store(true, Ordering::Relaxed);
+
+            Ok(())
+        }
+
+        let queue = Uuid::new_v4().to_string();
+        let channel = ctx.connection.open_channel().await?;
+
+        channel
+            .queue_declare(QueueDeclareArguments::new(&queue).durable(true).finish())
+            .await?;
+        channel
+            .exchange_declare(ExchangeDeclareArguments::new("test-exchange", "direct"))
+            .await?;
+        channel
+            .queue_bind(QueueBindArguments::new(
+                &queue,
+                "test-exchange",
+                "test.routing.key",
+            ))
+            .await?;
+        let mut context = Context::new();
+        let success = Arc::new(AtomicBool::new(false));
+        context.data(success.clone());
+        let mut app = Streameroo::new(ctx.connection.clone(), context, "test-consumer");
+        app.consume(event_handler, &queue, 1).await?;
+
+        // Publish message to the exchange with specific routing key
+        channel
+            .publish(
+                "test-exchange",
+                "test.routing.key",
+                Json(TestEvent("hello".into())),
+            )
+            .await?;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(success.load(Ordering::Relaxed));
+        Ok(())
+    }
 }
-//
-//
-//
-//}
