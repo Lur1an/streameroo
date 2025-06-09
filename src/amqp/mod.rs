@@ -75,7 +75,7 @@ impl Streameroo {
         &self.connection
     }
 
-    pub async fn handle_ctrl_c(&mut self) -> &mut Self {
+    pub fn handle_ctrl_c(&mut self) -> &mut Self {
         let notify = self.shutdown.clone();
         tokio::spawn({
             async move {
@@ -173,7 +173,6 @@ mod test {
     use nix::sys::signal::Signal;
     use nix::unistd::Pid;
     use serde::{Deserialize, Serialize};
-    use std::convert::Infallible;
     use std::sync::atomic::{AtomicU8, Ordering};
     use std::time::{Duration, Instant};
     use test_context::test_context;
@@ -320,41 +319,48 @@ mod test {
         Ok(())
     }
 
-    //    #[test_context(AMQPTest)]
-    //    #[tokio::test]
-    //    async fn test_simple_handler_graceful_shutdown(ctx: &mut AMQPTest) -> anyhow::Result<()> {
-    //        let queue = Uuid::new_v4().to_string();
-    //        ctx.channel
-    //            .queue_declare(
-    //                &queue,
-    //                QueueDeclareOptions {
-    //                    auto_delete: true,
-    //                    ..Default::default()
-    //                },
-    //                Default::default(),
-    //            )
-    //            .await?;
-    //        let counter = Arc::new(AtomicU8::new(0));
-    //        let mut context = Context::new(ctx.channel.clone());
-    //        context.data(counter.clone());
-    //
-    //        let mut app = Streameroo::new(context, "test-consumer");
-    //        app.consume(event_handler, &queue).await?;
-    //        let join = tokio::spawn(app.join(true));
-    //        tokio::time::sleep(Duration::from_millis(100)).await;
-    //
-    //        nix::sys::signal::kill(Pid::this(), Signal::SIGINT).unwrap();
-    //        ctx.channel
-    //            .publish("", &queue, Json(TestEvent("hello".into())))
-    //            .await?;
-    //        tokio::time::sleep(Duration::from_millis(100)).await;
-    //        // Use timeout as if the signal handling fails `app.join` will never complete
-    //        tokio::time::timeout(Duration::from_secs(2), join).await???;
-    //        // We killed the process, however the handler has been spawned once since we don't abort
-    //        // the delivery consumption future.
-    //        assert_eq!(counter.load(Ordering::Relaxed), 1);
-    //        Ok(())
-    //    }
+    #[test_context(AMQPTest)]
+    #[tokio::test]
+    async fn test_simple_handler_graceful_shutdown(ctx: &mut AMQPTest) -> anyhow::Result<()> {
+        async fn event_handler(
+            counter: StateOwned<Arc<AtomicU8>>,
+            event: Json<TestEvent>,
+        ) -> anyhow::Result<()> {
+            let event = event.into_inner();
+            assert_eq!(event.0, "hello");
+            counter.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        let queue = Uuid::new_v4().to_string();
+        let channel = ctx.connection.open_channel().await?;
+        channel
+            .queue_declare(QueueDeclareArguments::new(&queue))
+            .await?;
+        let counter = Arc::new(AtomicU8::new(0));
+        let mut context = Context::new();
+        context.data(counter.clone());
+
+        let mut app = Streameroo::new(ctx.connection.clone(), context, "test-consumer");
+        app.consume(event_handler, &queue, 1).await?;
+        let join = tokio::spawn(async move { app.handle_ctrl_c().join().await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        channel
+            .publish("", &queue, Json(TestEvent("hello".into())))
+            .await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        nix::sys::signal::kill(Pid::this(), Signal::SIGINT).unwrap();
+        channel
+            .publish("", &queue, Json(TestEvent("hello".into())))
+            .await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Use timeout as if the signal handling fails `app.join` will never complete
+        tokio::time::timeout(Duration::from_secs(2), join).await??;
+        // We killed the process, however the handler has been spawned once since we don't abort
+        // the delivery consumption future.
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+        Ok(())
+    }
 }
 //
 //
