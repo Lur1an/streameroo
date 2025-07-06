@@ -1779,6 +1779,7 @@ dependencies = [
  "bytes",
  "fnv",
  "nix",
+ "pin-project",
  "rabbitmq-stream-client",
  "rmp-serde",
  "serde",

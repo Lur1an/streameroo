@@ -16,6 +16,8 @@ pub use extensions::*;
 pub use handler::*;
 pub use result::*;
 
+use crate::context::Context;
+
 use self::consumer::Consumer;
 use amqprs::channel::{BasicConsumeArguments, BasicQosArguments};
 use std::future::Future;

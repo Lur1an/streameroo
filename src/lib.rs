@@ -1,4 +1,5 @@
 pub mod amqp;
+pub mod context;
 pub mod event;
 
 #[cfg(feature = "rabbitmq_stream")]

@@ -23,6 +23,7 @@ amqprs = { version = "2.1.1", features = ["urispec"]}
 testcontainers-modules = { version = "0.12.1", features = ["rabbitmq"], optional = true }
 test-context = { version = "0.3.0", optional = true }
 rabbitmq-stream-client = { version = "0.9.0", features = ["serde"], optional = true }
+pin-project = { version = "1.1.10", optional = true }
 
 [profile.release]
 panic = "abort"
@@ -35,7 +36,7 @@ json = ["serde", "serde_json"]
 bson = ["dep:bson"]
 bytes = ["dep:bytes"]
 amqp-test = ["dep:testcontainers-modules", "dep:test-context"]
-rabbitmq_stream = ["dep:rabbitmq-stream-client"]
+rabbitmq_stream = ["dep:rabbitmq-stream-client", "dep:pin-project"]
 
 [dev-dependencies]
 anyhow = "1.0.91"

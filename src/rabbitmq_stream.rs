@@ -1,43 +1,83 @@
+use std::pin::Pin;
+
+use rabbitmq_stream_client::error::ConsumerCreateError;
+use rabbitmq_stream_client::types::OffsetSpecification;
+use rabbitmq_stream_client::{Consumer, ConsumerBuilder, Environment};
+use tokio_stream::Stream;
+
+use crate::event::Decode;
+
+pub trait StreamerooExt {}
+
+pub struct StreamerooStream<T> {
+    consumer: Consumer,
+    confirm_offset: Option<()>,
+    phantom: std::marker::PhantomData<T>,
+}
+
+impl<T> StreamerooStream<T> {
+    pub async fn with_offset(
+        base: impl Fn() -> ConsumerBuilder,
+        stream: &str,
+        environment: Environment,
+    ) -> Result<Self, ConsumerCreateError> {
+        let offset = base()
+            .offset(OffsetSpecification::First)
+            .build(stream)
+            .await?
+            .query_offset()
+            .await
+            .unwrap_or(0);
+        let consumer = base()
+            .offset(OffsetSpecification::Offset(offset))
+            .build(stream)
+            .await?;
+        Ok(Self {
+            consumer,
+            confirm_offset: None,
+            phantom: std::marker::PhantomData,
+        })
+    }
+
+    pub fn from_consumer(consumer: Consumer) -> Self {
+        Self {
+            consumer,
+            confirm_offset: None,
+            phantom: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<T> Stream for StreamerooStream<T>
+where
+    T: Decode,
+{
+    type Item = T;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        todo!()
+    }
+}
+
 #[cfg(test)]
 mod test {
-    use std::time::Duration;
+    use bson::Uuid;
+    use rabbitmq_stream_client::types::RoutingStrategy;
+    use rabbitmq_stream_client::Environment;
+    use serde::{Deserialize, Serialize};
 
-    use rabbitmq_stream_client::{Environment, EnvironmentBuilder};
-    use test_context::futures::FutureExt;
-    use testcontainers_modules::rabbitmq::RabbitMq;
-    use testcontainers_modules::testcontainers::core::{
-        CmdWaitFor, ExecCommand, IntoContainerPort, WaitFor,
-    };
-    use testcontainers_modules::testcontainers::runners::AsyncRunner;
-    use testcontainers_modules::testcontainers::{ContainerAsync, GenericImage, ImageExt};
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct TestEvent {
+        hello: String,
+        deez: Option<String>,
+    }
 
     #[tokio::test]
     async fn test_deez() -> anyhow::Result<()> {
-        // let container = GenericImage::new("rabbitmq", "4-management")
-        //     .with_exposed_port(5552.tcp())
-        //     .with_wait_for(WaitFor::message_on_stdout(
-        //         "Server startup complete; 4 plugins started.",
-        //     ))
-        //     .with_env_var(
-        //         "RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS",
-        //         "-rabbitmq_stream advertised_host localhost",
-        //     )
-        //     .start()
-        //     .await?;
-        // tokio::time::sleep(Duration::from_secs(5)).await;
-        // let cmd = ExecCommand::new(["rabbitmq-plugins enable rabbitmq_stream"])
-        //     .with_cmd_ready_condition(CmdWaitFor::message_on_stdout("Plugins changed;"));
-
-        // let _ = container.exec(cmd).await;
-        let environment = Environment::builder()
-            // .host(&container.get_host().await?.to_string())
-            // .port(container.get_host_port_ipv4(5552).await?)
-            // .username("guest")
-            // .password("guest")
-            // .virtual_host("/")
-            .build()
-            .await
-            .expect("Failed to build environment");
+        let environment = Environment::builder().build().await?;
         Ok(())
     }
 }

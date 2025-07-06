@@ -1,16 +1,10 @@
 use amqprs::channel::{Channel, ConsumerMessage};
 use amqprs::{AmqpDeliveryTag, BasicProperties};
-use fnv::FnvHashMap;
-use std::any::{Any, TypeId};
+use std::any::Any;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
-pub struct Store(FnvHashMap<TypeId, &'static (dyn Any + Send + Sync)>);
-
-pub struct Context {
-    /// A generic data storage for shared instances of types
-    pub(crate) data: Store,
-}
+use crate::context::Context;
 
 macro_rules! amqp_wrapper {
     ($ty:ty, $inner:ty) => {
@@ -45,30 +39,6 @@ amqp_wrapper!(Redelivered, bool);
 impl Default for Context {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-impl Context {
-    pub fn new() -> Self {
-        Self {
-            data: Store(FnvHashMap::default()),
-        }
-    }
-
-    pub fn data<D: Any + Send + Sync + 'static>(&mut self, data: D) {
-        let data = Box::new(data);
-        self.data.0.insert(TypeId::of::<D>(), Box::leak(data));
-    }
-
-    pub fn data_unchecked<D: Any + Send + Sync + 'static>(&self) -> &'static D {
-        self.data_opt::<D>().unwrap()
-    }
-
-    pub fn data_opt<D: Any + Send + Sync + 'static>(&self) -> Option<&'static D> {
-        self.data
-            .0
-            .get(&TypeId::of::<D>())
-            .and_then(|x| x.downcast_ref::<D>())
     }
 }
 
