@@ -65,9 +65,11 @@ where
 #[cfg(test)]
 mod test {
     use bson::Uuid;
+    use rabbitmq_stream_client::types::OffsetSpecification::Next;
     use rabbitmq_stream_client::types::RoutingStrategy;
     use rabbitmq_stream_client::Environment;
     use serde::{Deserialize, Serialize};
+    use test_context::futures::StreamExt;
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     struct TestEvent {
@@ -78,6 +80,15 @@ mod test {
     #[tokio::test]
     async fn test_deez() -> anyhow::Result<()> {
         let environment = Environment::builder().build().await?;
+        let s_producer = environment
+            .super_stream_producer(RoutingStrategy::RoutingKeyStrategy(()))
+            .build("test")
+            .await?;
+        let s_consumer = environment
+            .super_stream_consumer()
+            .offset(Next)
+            .build("test")
+            .await?;
         Ok(())
     }
 }
