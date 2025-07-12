@@ -7,15 +7,15 @@ use uuid::Uuid;
 
 use crate::event::{Decode, Encode};
 
-use super::Error;
+use super::{AMQPConnection, Error};
 
 const DIRECT_REPLY_TO_QUEUE: &str = "amq.rabbitmq.reply-to";
 
 pub trait ChannelExt {
     fn publish<E>(
         &self,
-        exchange: impl AsRef<str>,
-        routing_key: impl AsRef<str>,
+        exchange: &str,
+        routing_key: &str,
         event: E,
     ) -> impl Future<Output = Result<(), Error>>
     where
@@ -25,8 +25,8 @@ pub trait ChannelExt {
     /// https://www.rabbitmq.com/docs/direct-reply-to
     fn direct_rpc<E, T>(
         &mut self,
-        exchange: impl AsRef<str>,
-        routing_key: impl AsRef<str>,
+        exchange: &str,
+        routing_key: &str,
         timeout: Duration,
         event: E,
     ) -> impl Future<Output = Result<T, Error>>
@@ -45,17 +45,12 @@ pub trait ChannelExt {
 }
 
 impl ChannelExt for amqprs::channel::Channel {
-    async fn publish<E>(
-        &self,
-        exchange: impl AsRef<str>,
-        routing_key: impl AsRef<str>,
-        event: E,
-    ) -> Result<(), Error>
+    async fn publish<E>(&self, exchange: &str, routing_key: &str, event: E) -> Result<(), Error>
     where
         E: Encode,
     {
         self.publish_with_options(
-            BasicPublishArguments::new(exchange.as_ref(), routing_key.as_ref()),
+            BasicPublishArguments::new(exchange, routing_key),
             Default::default(),
             event,
         )
@@ -64,8 +59,8 @@ impl ChannelExt for amqprs::channel::Channel {
 
     async fn direct_rpc<E, T>(
         &mut self,
-        exchange: impl AsRef<str>,
-        routing_key: impl AsRef<str>,
+        exchange: &str,
+        routing_key: &str,
         timeout: Duration,
         event: E,
     ) -> Result<T, Error>
@@ -83,7 +78,7 @@ impl ChannelExt for amqprs::channel::Channel {
         properties.with_reply_to(DIRECT_REPLY_TO_QUEUE);
 
         self.publish_with_options(
-            BasicPublishArguments::new(exchange.as_ref(), routing_key.as_ref()),
+            BasicPublishArguments::new(exchange, routing_key),
             properties,
             event,
         )
@@ -101,6 +96,56 @@ impl ChannelExt for amqprs::channel::Channel {
             }
         };
         tokio::time::timeout(timeout, fut).await?
+    }
+
+    async fn publish_with_options<E>(
+        &self,
+        args: BasicPublishArguments,
+        mut properties: BasicProperties,
+        event: E,
+    ) -> Result<(), Error>
+    where
+        E: Encode,
+    {
+        let payload = event.encode().map_err(|e| Error::Event(e.into()))?;
+        if properties.content_type().is_none() {
+            if let Some(content_type) = E::content_type() {
+                properties.with_content_type(content_type);
+            }
+        }
+        self.basic_publish(properties, payload, args).await?;
+        Ok(())
+    }
+}
+
+impl ChannelExt for AMQPConnection {
+    async fn publish<E>(&self, exchange: &str, routing_key: &str, event: E) -> Result<(), Error>
+    where
+        E: Encode,
+    {
+        self.publish_with_options(
+            BasicPublishArguments::new(exchange, routing_key),
+            Default::default(),
+            event,
+        )
+        .await
+    }
+
+    async fn direct_rpc<E, T>(
+        &mut self,
+        exchange: &str,
+        routing_key: &str,
+        timeout: Duration,
+        event: E,
+    ) -> Result<T, Error>
+    where
+        E: Encode,
+        T: Decode,
+    {
+        let mut channel = self.open_channel().await?;
+        channel
+            .direct_rpc(exchange, routing_key, timeout, event)
+            .await
     }
 
     async fn publish_with_options<E>(

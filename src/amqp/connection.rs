@@ -1,5 +1,3 @@
-use super::Error;
-use crate::event::Encode;
 use amqprs::callbacks::{DefaultChannelCallback, DefaultConnectionCallback};
 use amqprs::channel::{BasicPublishArguments, Channel};
 use amqprs::connection::{Connection, OpenConnectionArguments};
@@ -158,6 +156,8 @@ impl AMQPConnection {
         Ok(tokio::time::timeout(self.rpc_timeout, fut).await???)
     }
 
+    /// Wrapper for a basic_publish operation over the AMQPRpc channel
+    /// Will use a Channel from the pool to perform the operation
     pub async fn basic_publish(
         &self,
         properties: BasicProperties,
@@ -178,42 +178,6 @@ impl AMQPConnection {
             Ok::<_, ConnectionError>(rx.await?)
         };
         Ok(tokio::time::timeout(self.rpc_timeout, fut).await???)
-    }
-
-    pub async fn publish<E>(
-        &self,
-        exchange: impl AsRef<str>,
-        routing_key: impl AsRef<str>,
-        event: E,
-    ) -> Result<(), Error>
-    where
-        E: Encode,
-    {
-        self.publish_with_options(
-            BasicPublishArguments::new(exchange.as_ref(), routing_key.as_ref()),
-            Default::default(),
-            event,
-        )
-        .await
-    }
-
-    pub async fn publish_with_options<E>(
-        &self,
-        args: BasicPublishArguments,
-        mut properties: BasicProperties,
-        event: E,
-    ) -> Result<(), Error>
-    where
-        E: Encode,
-    {
-        let payload = event.encode().map_err(|e| Error::Event(e.into()))?;
-        if properties.content_type().is_none() {
-            if let Some(content_type) = E::content_type() {
-                properties.with_content_type(content_type);
-            }
-        }
-        self.basic_publish(properties, payload, args).await?;
-        Ok(())
     }
 }
 
