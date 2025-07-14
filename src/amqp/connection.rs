@@ -183,20 +183,48 @@ impl AMQPConnection {
 
 #[cfg(any(test, feature = "amqp-test"))]
 pub mod amqp_test {
+    use crate::event::Decode;
+
     use super::*;
+    use amqprs::channel::BasicConsumeArguments;
     use amqprs::connection::OpenConnectionArguments;
     use test_context::AsyncTestContext;
     use testcontainers_modules::rabbitmq::RabbitMq;
     use testcontainers_modules::testcontainers::core::IntoContainerPort;
     use testcontainers_modules::testcontainers::runners::AsyncRunner;
     use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
+    use tokio::time::timeout;
+    use uuid::Uuid;
 
     pub struct AMQPTest {
         pub connection: AMQPConnection,
         pub container: ContainerAsync<RabbitMq>,
     }
+
     pub async fn start_rabbitmq() -> (ContainerAsync<RabbitMq>, OpenConnectionArguments) {
         start_rabbitmq_with_port(None).await
+    }
+
+    impl AMQPConnection {
+        /// Consumes the next message in line from the given queue and acks it
+        pub async fn consume_next<E>(&self, queue: &str) -> E
+        where
+            E: Decode,
+        {
+            let channel = self.open_channel().await.unwrap();
+            let (_, mut rx) = channel
+                .basic_consume_rx(BasicConsumeArguments::new(
+                    queue,
+                    &Uuid::new_v4().to_string(),
+                ))
+                .await
+                .unwrap();
+            let delivery = timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            E::decode(delivery.content.unwrap()).unwrap()
+        }
     }
 
     pub async fn start_rabbitmq_with_port(

@@ -191,6 +191,7 @@ mod test {
     use connection::amqp_test::AMQPTest;
     use nix::sys::signal::Signal;
     use nix::unistd::Pid;
+    use result::Publish;
     use serde::{Deserialize, Serialize};
     use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
     use std::time::{Duration, Instant};
@@ -480,6 +481,46 @@ mod test {
             .await?;
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert!(success.load(Ordering::Relaxed));
+        Ok(())
+    }
+
+    #[test_context(AMQPTest)]
+    #[tokio::test]
+    async fn test_publish_action_with_consume_next(ctx: &mut AMQPTest) -> anyhow::Result<()> {
+        async fn event_handler(
+            event: Json<TestEvent>,
+        ) -> anyhow::Result<Publish<Json<TestEvent>>> {
+            let event = event.into_inner();
+            assert_eq!(event.0, "initial");
+            Ok(Publish::new(
+                Json(TestEvent("forwarded".into())),
+                "",
+                "forward-queue",
+            ))
+        }
+
+        let initial_queue = Uuid::new_v4().to_string();
+        let forward_queue = "forward-queue";
+        let channel = ctx.connection.open_channel().await?;
+        
+        channel
+            .queue_declare(QueueDeclareArguments::new(&initial_queue))
+            .await?;
+        channel
+            .queue_declare(QueueDeclareArguments::new(forward_queue))
+            .await?;
+
+        let context = Context::new();
+        let mut app = Streameroo::new(ctx.connection.clone(), context, "test-consumer");
+        app.consume(event_handler, &initial_queue, 1).await?;
+
+        ctx.connection
+            .publish("", &initial_queue, Json(TestEvent("initial".into())))
+            .await?;
+
+        let forwarded_event: Json<TestEvent> = ctx.connection.consume_next(forward_queue).await;
+        assert_eq!(forwarded_event.into_inner().0, "forwarded");
+
         Ok(())
     }
 
