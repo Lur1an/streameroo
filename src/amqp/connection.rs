@@ -181,8 +181,8 @@ impl AMQPConnection {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod amqp_test {
+#[cfg(any(test, feature = "amqp-test"))]
+pub mod amqp_test {
     use super::*;
     use amqprs::connection::OpenConnectionArguments;
     use test_context::AsyncTestContext;
@@ -195,8 +195,11 @@ pub(crate) mod amqp_test {
         pub connection: AMQPConnection,
         pub container: ContainerAsync<RabbitMq>,
     }
+    pub async fn start_rabbitmq() -> (ContainerAsync<RabbitMq>, OpenConnectionArguments) {
+        start_rabbitmq_with_port(None).await
+    }
 
-    pub async fn start_rabbitmq(
+    pub async fn start_rabbitmq_with_port(
         static_port: Option<u16>,
     ) -> (ContainerAsync<RabbitMq>, OpenConnectionArguments) {
         let container = if let Some(port) = static_port {
@@ -216,8 +219,10 @@ pub(crate) mod amqp_test {
 
     impl AsyncTestContext for AMQPTest {
         async fn setup() -> Self {
+            #[cfg(test)]
             tracing_subscriber::fmt().init();
-            let (container, args) = start_rabbitmq(None).await;
+
+            let (container, args) = start_rabbitmq().await;
             let connection = AMQPConnection::connect(args).await.unwrap();
             AMQPTest {
                 connection,
@@ -237,7 +242,7 @@ mod test {
     #[tokio::test]
     async fn test_reconnect() -> anyhow::Result<()> {
         tracing_subscriber::fmt().init();
-        let (container, args) = amqp_test::start_rabbitmq(Some(42069)).await;
+        let (container, args) = amqp_test::start_rabbitmq_with_port(Some(42069)).await;
         let connection = AMQPConnection::connect(args).await?;
 
         let channel = connection.open_channel().await?;

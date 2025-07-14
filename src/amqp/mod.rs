@@ -478,7 +478,7 @@ mod test {
         }
 
         tracing_subscriber::fmt().init();
-        let (container, args) = connection::amqp_test::start_rabbitmq(Some(5672)).await;
+        let (container, args) = connection::amqp_test::start_rabbitmq_with_port(Some(5672)).await;
         let connection = AMQPConnection::connect(args).await?;
 
         let queue = Uuid::new_v4().to_string();
