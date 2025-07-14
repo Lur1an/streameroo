@@ -186,7 +186,7 @@ pub mod amqp_test {
     use crate::event::Decode;
 
     use super::*;
-    use amqprs::channel::BasicConsumeArguments;
+    use amqprs::channel::{BasicAckArguments, BasicConsumeArguments};
     use amqprs::connection::OpenConnectionArguments;
     use test_context::AsyncTestContext;
     use testcontainers_modules::rabbitmq::RabbitMq;
@@ -222,6 +222,13 @@ pub mod amqp_test {
             let delivery = timeout(Duration::from_secs(1), rx.recv())
                 .await
                 .unwrap()
+                .unwrap();
+            channel
+                .basic_ack(BasicAckArguments::new(
+                    delivery.deliver.unwrap().delivery_tag(),
+                    false,
+                ))
+                .await
                 .unwrap();
             E::decode(delivery.content.unwrap()).unwrap()
         }
