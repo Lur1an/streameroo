@@ -70,6 +70,24 @@ impl Streameroo {
         }
     }
 
+    /// Swaps the shutdown notifier with an externally provided one.
+    /// # Panics
+    /// Panics if the consumer is currently running tasks, as they are running with the old
+    /// shutdown.
+    pub fn with_shutdown(self, shutdown: Arc<Notify>) -> Self {
+        assert!(
+            self.tasks.is_empty(),
+            "Cannot swap shutdown notifier with tasks running"
+        );
+        Self {
+            connection: self.connection,
+            shutdown,
+            context: self.context,
+            consumer_tag: self.consumer_tag,
+            tasks: self.tasks,
+        }
+    }
+
     pub fn connection(&self) -> &AMQPConnection {
         &self.connection
     }
