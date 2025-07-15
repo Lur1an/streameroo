@@ -18,6 +18,7 @@ pub use result::*;
 
 use self::consumer::Consumer;
 use amqprs::channel::{BasicConsumeArguments, BasicQosArguments};
+use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
@@ -70,35 +71,26 @@ impl Streameroo {
         }
     }
 
-    /// Swaps the shutdown notifier with an externally provided one.
-    /// # Panics
-    /// Panics if the consumer is currently running tasks, as they are running with the old
-    /// shutdown.
-    pub fn with_shutdown(self, shutdown: Arc<Notify>) -> Self {
-        assert!(
-            self.tasks.is_empty(),
-            "Cannot swap shutdown notifier with tasks running"
-        );
-        Self {
-            connection: self.connection,
-            shutdown,
-            context: self.context,
-            consumer_tag: self.consumer_tag,
-            tasks: self.tasks,
-        }
-    }
-
     pub fn connection(&self) -> &AMQPConnection {
         &self.connection
     }
 
-    pub fn handle_ctrl_c(&mut self) -> &mut Self {
+    /// Listens for the given signal and disables all consumers when it is received.
+    /// Return type of the signal is ignored, so it can be a `Result<T, E>`, an `Option<T>`
+    /// or just `()`.
+    /// # Example
+    /// How to block until the signal is received and wait for all consumers to finish gracefully:
+    /// ```ignore
+    /// app.with_graceful_shutdown(tokio::signal::ctrl_c()).join().await;
+    /// ```
+    pub fn with_graceful_shutdown<F, T>(&mut self, signal: F) -> &mut Self
+    where
+        F: Future<Output = T> + Send + 'static,
+    {
         let notify = self.shutdown.clone();
         tokio::spawn({
             async move {
-                tokio::signal::ctrl_c()
-                    .await
-                    .expect("Failed to listen for shutdown signal");
+                signal.await;
                 tracing::info!("Shutdown intercepted, disabling consumers");
                 notify.notify_waiters();
             }
@@ -406,7 +398,11 @@ mod test {
 
         let mut app = Streameroo::new(ctx.connection.clone(), context, "test-consumer");
         app.consume(event_handler, &queue, 1).await?;
-        let join = tokio::spawn(async move { app.handle_ctrl_c().join().await });
+        let join = tokio::spawn(async move {
+            app.with_graceful_shutdown(tokio::signal::ctrl_c())
+                .join()
+                .await
+        });
         tokio::time::sleep(Duration::from_millis(100)).await;
         ctx.connection
             .publish("", &queue, Json(TestEvent("hello".into())))
@@ -487,9 +483,7 @@ mod test {
     #[test_context(AMQPTest)]
     #[tokio::test]
     async fn test_publish_action_with_consume_next(ctx: &mut AMQPTest) -> anyhow::Result<()> {
-        async fn event_handler(
-            event: Json<TestEvent>,
-        ) -> anyhow::Result<Publish<Json<TestEvent>>> {
+        async fn event_handler(event: Json<TestEvent>) -> anyhow::Result<Publish<Json<TestEvent>>> {
             let event = event.into_inner();
             assert_eq!(event.0, "initial");
             Ok(Publish::new(
@@ -502,7 +496,7 @@ mod test {
         let initial_queue = Uuid::new_v4().to_string();
         let forward_queue = "forward-queue";
         let channel = ctx.connection.open_channel().await?;
-        
+
         channel
             .queue_declare(QueueDeclareArguments::new(&initial_queue))
             .await?;
