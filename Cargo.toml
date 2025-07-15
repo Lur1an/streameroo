@@ -4,7 +4,7 @@ version = "0.3.8"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/lur1an/streameroo"
-keywords = ["amqp", "amqprs", "event"]
+keywords = ["amqp", "amqprs", "rabbitmq"]
 description = "Compilation of mini-frameworks & utilities for data-streaming applications"
 
 [dependencies]
