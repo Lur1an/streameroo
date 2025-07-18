@@ -5,6 +5,7 @@ use amqprs::channel::{
     BasicAckArguments, BasicConsumeArguments, BasicNackArguments, BasicQosArguments,
 };
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
 use tracing::{Instrument, Level};
@@ -71,6 +72,7 @@ where
                     Ok(consume) => consume,
                     Err(e) => {
                         tracing::error!(?e, "Failed to start consuming");
+                        tokio::time::sleep(Duration::from_secs(5)).await;
                         continue;
                     }
                 };
