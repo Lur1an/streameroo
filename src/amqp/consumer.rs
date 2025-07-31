@@ -1,8 +1,9 @@
 use super::connection::AMQPConnection;
 use super::{AMQPHandler, AMQPResult, Context};
-use crate::amqp::{create_delivery_context, Error};
+use crate::amqp::{Error, create_delivery_context};
 use amqprs::channel::{
     BasicAckArguments, BasicConsumeArguments, BasicNackArguments, BasicQosArguments,
+    ConsumerMessage,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,6 +43,87 @@ where
             notifier,
             _phantom: std::marker::PhantomData,
         }
+    }
+
+    /// Handles a single delivery by spawning a task to process it
+    fn handle_delivery(
+        &self,
+        delivery: ConsumerMessage,
+        channel: &amqprs::channel::Channel,
+        skip_ack: bool,
+        tasks: &mut JoinSet<()>,
+    ) {
+        let (delivery_context, payload) = create_delivery_context(delivery, &self.context, channel);
+        let handler = self.handler.clone();
+
+        #[cfg(feature = "telemetry")]
+        let span = super::telemetry::make_span_from_delivery_context(&delivery_context);
+        #[cfg(not(feature = "telemetry"))]
+        let span = {
+            let delivery_tag = delivery_context.delivery_tag;
+            tracing::span!(Level::INFO, "streameroo::consumer", delivery_tag)
+        };
+
+        let fut = async move {
+            match handler.call(payload, &delivery_context).await {
+                Ok(ret) => match ret.handle_result(&delivery_context).await {
+                    Ok(_) => {
+                        // On manual AMQPResult don't ack the result handling
+                        if skip_ack {
+                            return;
+                        }
+                        if let Err(e) = delivery_context
+                            .channel
+                            .basic_ack(BasicAckArguments {
+                                delivery_tag: delivery_context.delivery_tag,
+                                multiple: false,
+                            })
+                            .await
+                        {
+                            tracing::error!(?e, "Error acking delivery");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(?e, "Error processing AMQPResult. Nacking delivery");
+                        let nack_args = BasicNackArguments {
+                            delivery_tag: delivery_context.delivery_tag,
+                            multiple: false,
+                            requeue: true,
+                        };
+                        if let Err(e) = delivery_context.channel.basic_nack(nack_args).await {
+                            tracing::error!(?e, "Error nacking delivery");
+                        }
+                    }
+                },
+                // Decoding an event failed, this would fail again if we nacked the
+                // delivery, so the framework automatically nacks without requeue!.
+                Err(Error::Event(e)) => {
+                    tracing::error!(?e, "Error decoding event. Nacking without requeue");
+                    let nack_args = BasicNackArguments {
+                        delivery_tag: delivery_context.delivery_tag,
+                        multiple: false,
+                        requeue: false,
+                    };
+                    if let Err(e) = delivery_context.channel.basic_nack(nack_args).await {
+                        tracing::error!(?e, "Error acking delivery");
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(?e, "Error calling AMQP handler");
+                    let nack_args = BasicNackArguments {
+                        delivery_tag: delivery_context.delivery_tag,
+                        multiple: false,
+                        requeue: true,
+                    };
+                    tracing::info!(?nack_args, "Nacking delivery");
+                    if let Err(e) = delivery_context.channel.basic_nack(nack_args).await {
+                        tracing::error!(?e, "Error nacking delivery");
+                    }
+                }
+            }
+        };
+
+        tasks.spawn(fut.instrument(span));
     }
 
     /// Consumes the consumer and starts the loop.
@@ -84,68 +166,7 @@ where
                     },
                     delivery = consumer_rx.recv() => {
                         if let Some(delivery) = delivery {
-                            let (delivery_context, payload) = create_delivery_context(
-                                delivery,
-                                &self.context,
-                                &channel,
-                            );
-                            let delivery_tag = delivery_context.delivery_tag;
-                            let handler = self.handler.clone();
-                            let fut = async move {
-                                match handler.call(payload, &delivery_context).await {
-                                    Ok(ret) => match ret.handle_result(&delivery_context).await {
-                                        Ok(_) => {
-                                            // On manual AMQPResult don't ack the result handling
-                                            if skip_ack {
-                                                return;
-                                            }
-                                            tracing::info!("Acking delivery");
-                                            if let Err(e) = delivery_context.channel.basic_ack(BasicAckArguments {
-                                                delivery_tag: delivery_context.delivery_tag,
-                                                multiple: false
-                                            }).await {
-                                                tracing::error!(?e, "Error acking delivery");
-                                            }
-                                        }
-                                        Err(e) => {
-                                            tracing::error!(?e, "Error processing AMQPResult. Nacking delivery");
-                                            let nack_args = BasicNackArguments {
-                                                delivery_tag: delivery_context.delivery_tag, multiple: false, requeue: true
-                                            };
-                                            if let Err(e) = delivery_context.channel.basic_nack(nack_args).await {
-                                                tracing::error!(?e, "Error nacking delivery");
-                                            }
-                                        }
-                                    },
-                                    // Decoding an event failed, this would fail again if we nacked the
-                                    // delivery, so the framework automatically nacks without requeue!.
-                                    Err(Error::Event(e)) => {
-                                        tracing::error!(?e, "Error decoding event");
-                                        let nack_args = BasicNackArguments {
-                                            delivery_tag: delivery_context.delivery_tag, multiple: false, requeue: false
-                                        };
-                                        tracing::info!(?nack_args, "Nacking delivery");
-                                        if let Err(e) = delivery_context.channel.basic_nack(nack_args).await {
-                                            tracing::error!(?e, "Error acking delivery");
-                                        }
-                                    }
-                                    Err(e) => {
-                                        tracing::error!(?e, "Error calling AMQP handler");
-                                        let nack_args = BasicNackArguments {
-                                            delivery_tag: delivery_context.delivery_tag, multiple: false, requeue: true
-                                        };
-                                        tracing::info!(?nack_args, "Nacking delivery");
-                                        if let Err(e) = delivery_context.channel.basic_nack(nack_args).await {
-                                            tracing::error!(?e, "Error nacking delivery");
-                                        }
-                                    }
-                                }
-                            };
-                            tasks.spawn(fut.instrument(tracing::span!(
-                                Level::INFO,
-                                "streameroo",
-                                delivery_tag
-                            )));
+                            self.handle_delivery(delivery, &channel, skip_ack, &mut tasks);
                         } else {
                             tracing::warn!("Consumer closed unexpectedly");
                             break

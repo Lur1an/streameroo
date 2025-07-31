@@ -1,10 +1,12 @@
 services:
-  rabbitmq:
-    image: rabbitmq:3.13-management
-    container_name: rabbitmq
-    ports:
-      - "5672:5672"
-      - "15672:15672"
+  jaeger:
+    image: jaegertracing/all-in-one:latest
     environment:
-      RABBITMQ_DEFAULT_USER: user
-      RABBITMQ_DEFAULT_PASS: password
+      - COLLECTOR_OTLP_ENABLED=true
+    ports:
+      - "16686:16686" # Jaeger UI
+      - "4317:4317" # OTLP gRPC receiver
+      - "4318:4318" # OTLP HTTP receiver
+      - "14268:14268" # Jaeger collector HTTP
+      - "14269:14269" # Jaeger collector health check
+      - "14250:14250" # Jaeger gRPC

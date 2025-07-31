@@ -1,7 +1,7 @@
+use amqprs::BasicProperties;
 use amqprs::callbacks::{DefaultChannelCallback, DefaultConnectionCallback};
 use amqprs::channel::{BasicPublishArguments, Channel};
 use amqprs::connection::{Connection, OpenConnectionArguments};
-use amqprs::BasicProperties;
 use std::time::Duration;
 use tokio::sync::mpsc::{self};
 use tokio::sync::oneshot;
@@ -199,6 +199,8 @@ pub mod amqp_test {
     pub struct AMQPTest {
         pub connection: AMQPConnection,
         pub container: ContainerAsync<RabbitMq>,
+        #[cfg(test)]
+        _guard: init_tracing_opentelemetry::otlp::OtelGuard,
     }
 
     pub async fn start_rabbitmq() -> (ContainerAsync<RabbitMq>, OpenConnectionArguments) {
@@ -255,13 +257,16 @@ pub mod amqp_test {
     impl AsyncTestContext for AMQPTest {
         async fn setup() -> Self {
             #[cfg(test)]
-            tracing_subscriber::fmt().init();
+            let _guard =
+                init_tracing_opentelemetry::tracing_subscriber_ext::init_subscribers().unwrap();
 
             let (container, args) = start_rabbitmq().await;
             let connection = AMQPConnection::connect(args).await.unwrap();
             AMQPTest {
                 connection,
                 container,
+                #[cfg(test)]
+                _guard,
             }
         }
         async fn teardown(self) {
