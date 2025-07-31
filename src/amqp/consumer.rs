@@ -99,7 +99,6 @@ where
                                             if skip_ack {
                                                 return;
                                             }
-                                            tracing::info!("Acking delivery");
                                             if let Err(e) = delivery_context.channel.basic_ack(BasicAckArguments {
                                                 delivery_tag: delivery_context.delivery_tag,
                                                 multiple: false
@@ -120,11 +119,10 @@ where
                                     // Decoding an event failed, this would fail again if we nacked the
                                     // delivery, so the framework automatically nacks without requeue!.
                                     Err(Error::Event(e)) => {
-                                        tracing::error!(?e, "Error decoding event");
+                                        tracing::error!(?e, "Error decoding event. Nacking without requeue");
                                         let nack_args = BasicNackArguments {
                                             delivery_tag: delivery_context.delivery_tag, multiple: false, requeue: false
                                         };
-                                        tracing::info!(?nack_args, "Nacking delivery");
                                         if let Err(e) = delivery_context.channel.basic_nack(nack_args).await {
                                             tracing::error!(?e, "Error acking delivery");
                                         }
@@ -143,7 +141,7 @@ where
                             };
                             tasks.spawn(fut.instrument(tracing::span!(
                                 Level::INFO,
-                                "streameroo",
+                                "streameroo::consumer",
                                 delivery_tag
                             )));
                         } else {

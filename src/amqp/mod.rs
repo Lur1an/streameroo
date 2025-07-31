@@ -6,6 +6,8 @@ mod context;
 mod extensions;
 mod handler;
 mod result;
+#[cfg(feature = "telemetry")]
+mod telemetry;
 
 pub use amqprs;
 pub use auto::*;

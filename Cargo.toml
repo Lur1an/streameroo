@@ -35,6 +35,7 @@ json = ["serde", "serde_json"]
 bson = ["dep:bson"]
 bytes = ["dep:bytes"]
 amqp-test = ["dep:testcontainers-modules", "dep:test-context"]
+telemetry = []
 
 [dev-dependencies]
 anyhow = "1.0.91"
