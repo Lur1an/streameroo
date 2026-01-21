@@ -200,7 +200,7 @@ pub mod amqp_test {
         pub connection: AMQPConnection,
         pub container: ContainerAsync<RabbitMq>,
         #[cfg(test)]
-        _guard: init_tracing_opentelemetry::otlp::OtelGuard,
+        _guard: init_tracing_opentelemetry::Guard,
     }
 
     pub async fn start_rabbitmq() -> (ContainerAsync<RabbitMq>, OpenConnectionArguments) {
@@ -257,8 +257,9 @@ pub mod amqp_test {
     impl AsyncTestContext for AMQPTest {
         async fn setup() -> Self {
             #[cfg(test)]
-            let _guard =
-                init_tracing_opentelemetry::tracing_subscriber_ext::init_subscribers().unwrap();
+            let _guard = init_tracing_opentelemetry::TracingConfig::production()
+                .init_subscriber()
+                .unwrap();
 
             let (container, args) = start_rabbitmq().await;
             let connection = AMQPConnection::connect(args).await.unwrap();
@@ -271,6 +272,12 @@ pub mod amqp_test {
         }
         async fn teardown(self) {
             self.container.rm().await.unwrap();
+            #[cfg(test)]
+            {
+                drop(self._guard);
+                // Give time for otel to flush
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
         }
     }
 }

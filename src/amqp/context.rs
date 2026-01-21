@@ -144,6 +144,12 @@ impl FromDeliveryContext<'_> for RoutingKey {
     }
 }
 
+impl FromDeliveryContext<'_> for BasicProperties {
+    fn from_delivery_context(context: &'_ DeliveryContext) -> Self {
+        context.properties.clone()
+    }
+}
+
 impl FromDeliveryContext<'_> for ReplyTo {
     fn from_delivery_context(context: &DeliveryContext) -> Self {
         ReplyTo(

@@ -88,7 +88,9 @@ pub fn make_span_from_delivery_context(delivery_context: &DeliveryContext) -> tr
     span.set_attribute("delivery_tag", delivery_context.delivery_tag.to_string());
     if let Some(field_table) = delivery_context.properties.headers() {
         let context = extract_context(field_table);
-        span.set_parent(context);
+        if let Err(e) = span.set_parent(context) {
+            tracing::warn!("Failed to set parent context for span: {e}");
+        }
     }
     span
 }

@@ -7,7 +7,7 @@ mod extensions;
 mod handler;
 mod result;
 #[cfg(feature = "telemetry")]
-mod telemetry;
+pub mod telemetry;
 
 pub use amqprs;
 pub use auto::*;
@@ -181,7 +181,7 @@ mod test {
     use crate::event::Json;
     use crate::field_table;
     use amqprs::channel::{ExchangeDeclareArguments, QueueBindArguments, QueueDeclareArguments};
-    use amqprs::FieldValue;
+    use amqprs::{BasicProperties, FieldValue};
     use connection::amqp_test::AMQPTest;
     use nix::sys::signal::Signal;
     use nix::unistd::Pid;
@@ -255,10 +255,12 @@ mod test {
     #[tokio::test]
     async fn test_reply_to_handler(ctx: &mut AMQPTest) -> anyhow::Result<()> {
         async fn reply_to_handler(
+            properties: BasicProperties,
             event: Json<TestEvent>,
         ) -> anyhow::Result<PublishReply<Json<TestEvent>>> {
             let event = event.into_inner();
             assert_eq!(event.0, "hello");
+            tracing::info!(?properties);
             Ok(PublishReply(Json(TestEvent("world".into()))))
         }
         let queue = Uuid::new_v4().to_string();

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
-use tracing::{Instrument, Level};
+use tracing::Instrument;
 
 pub struct Consumer<H, P, T, Err> {
     context: Arc<Context>,
@@ -61,7 +61,7 @@ where
         #[cfg(not(feature = "telemetry"))]
         let span = {
             let delivery_tag = delivery_context.delivery_tag;
-            tracing::span!(Level::INFO, "streameroo::consumer", delivery_tag)
+            tracing::span!(tracing::Level::INFO, "streameroo::consumer", delivery_tag)
         };
 
         let fut = async move {

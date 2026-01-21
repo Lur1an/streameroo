@@ -112,16 +112,18 @@ impl ChannelExt for amqprs::channel::Channel {
         E: Encode,
     {
         let payload = event.encode().map_err(|e| Error::Event(e.into()))?;
-        if properties.content_type().is_none() {
-            if let Some(content_type) = E::content_type() {
-                properties.with_content_type(content_type);
-            }
+        if properties.content_type().is_none()
+            && let Some(content_type) = E::content_type()
+        {
+            properties.with_content_type(content_type);
         }
 
         #[cfg(feature = "telemetry")]
         {
             use super::telemetry::{inject_context, make_span_from_properties};
+            use opentelemetry::Context;
             use opentelemetry::trace::SpanKind;
+            use tracing_opentelemetry::OpenTelemetrySpanExt;
             use tracing_opentelemetry_instrumentation_sdk::find_context_from_tracing;
 
             let mut headers = properties.headers().cloned().unwrap_or_default();
@@ -131,6 +133,9 @@ impl ChannelExt for amqprs::channel::Channel {
                 &args.exchange,
                 &args.routing_key,
             );
+            if let Err(e) = span.set_parent(Context::current()) {
+                tracing::warn!("Failed to set parent context for span: {e}");
+            };
             inject_context(&find_context_from_tracing(&span), &mut headers);
             properties.with_headers(headers);
         }
@@ -176,10 +181,10 @@ impl ChannelExt for AMQPConnection {
         E: Encode,
     {
         let payload = event.encode().map_err(|e| Error::Event(e.into()))?;
-        if properties.content_type().is_none() {
-            if let Some(content_type) = E::content_type() {
-                properties.with_content_type(content_type);
-            }
+        if properties.content_type().is_none()
+            && let Some(content_type) = E::content_type()
+        {
+            properties.with_content_type(content_type);
         }
 
         #[cfg(feature = "telemetry")]

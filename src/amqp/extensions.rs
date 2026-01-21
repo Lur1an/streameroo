@@ -1,4 +1,5 @@
-use amqprs::FieldValue;
+use amqprs::{FieldName, FieldTable, FieldValue};
+use std::collections::HashMap;
 
 #[macro_export]
 macro_rules! field_table {
@@ -22,6 +23,16 @@ pub enum XQueueType {
     Classic,
     Quorum,
     Stream,
+}
+
+pub fn table_from_map(map: &HashMap<String, String>) -> FieldTable {
+    let mut table = FieldTable::default();
+    for (key, value) in map {
+        if let Ok(name) = FieldName::try_from(key.as_str()) {
+            table.insert(name, FieldValue::from(value.as_str()));
+        }
+    }
+    table
 }
 
 impl From<XQueueType> for FieldValue {
