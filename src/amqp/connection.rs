@@ -216,10 +216,11 @@ pub mod amqp_test {
         {
             let channel = self.open_channel().await.unwrap();
             let (_, rx) = channel
-                .basic_consume_rx(BasicConsumeArguments::new(
-                    queue,
-                    &Uuid::new_v4().to_string(),
-                ))
+                .basic_consume_rx(
+                    BasicConsumeArguments::new(queue, &Uuid::new_v4().to_string())
+                        .manual_ack(false)
+                        .finish(),
+                )
                 .await
                 .unwrap();
             UnboundedReceiverStream::new(rx)
