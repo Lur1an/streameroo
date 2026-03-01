@@ -183,17 +183,17 @@ impl AMQPConnection {
 
 #[cfg(any(test, feature = "amqp-test"))]
 pub mod amqp_test {
-    use crate::event::Decode;
-
     use super::*;
-    use amqprs::channel::{BasicAckArguments, BasicConsumeArguments};
+    use crate::event::Decode;
+    use amqprs::channel::BasicConsumeArguments;
     use amqprs::connection::OpenConnectionArguments;
     use test_context::AsyncTestContext;
     use testcontainers_modules::rabbitmq::RabbitMq;
     use testcontainers_modules::testcontainers::core::IntoContainerPort;
     use testcontainers_modules::testcontainers::runners::AsyncRunner;
     use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
-    use tokio::time::timeout;
+    use tokio_stream::wrappers::UnboundedReceiverStream;
+    use tokio_stream::{Stream, StreamExt};
     use uuid::Uuid;
 
     pub struct AMQPTest {
@@ -208,31 +208,36 @@ pub mod amqp_test {
     }
 
     impl AMQPConnection {
-        /// Consumes the next message in line from the given queue and acks it
-        pub async fn consume_next<E>(&self, queue: &str) -> E
+        /// Consumes all messages left in the queue with a set timeout for each message
+        /// whilst decoding it into the given type
+        pub async fn drain_queue<E>(&self, queue: &str, timeout: Duration) -> impl Stream<Item = E>
         where
             E: Decode,
         {
             let channel = self.open_channel().await.unwrap();
-            let (_, mut rx) = channel
+            let (_, rx) = channel
                 .basic_consume_rx(BasicConsumeArguments::new(
                     queue,
                     &Uuid::new_v4().to_string(),
                 ))
                 .await
                 .unwrap();
-            let delivery = timeout(Duration::from_secs(1), rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
-            channel
-                .basic_ack(BasicAckArguments::new(
-                    delivery.deliver.unwrap().delivery_tag(),
-                    false,
-                ))
-                .await
-                .unwrap();
-            E::decode(delivery.content.unwrap()).unwrap()
+            UnboundedReceiverStream::new(rx)
+                .timeout(timeout)
+                .map_while(|result| {
+                    result
+                        .map(|msg| E::decode(msg.content.unwrap_or_default()).unwrap())
+                        .ok()
+                })
+        }
+        /// Consumes the next message in line from the given queue and acks it
+        pub async fn consume_next<E>(&self, queue: &str) -> E
+        where
+            E: Decode,
+        {
+            let rx = self.drain_queue(queue, Duration::from_secs(2)).await;
+            tokio::pin!(rx);
+            rx.next().await.unwrap()
         }
     }
 
@@ -289,7 +294,7 @@ mod test {
     #[tokio::test]
     async fn test_reconnect() -> anyhow::Result<()> {
         tracing_subscriber::fmt().init();
-        let (container, args) = amqp_test::start_rabbitmq_with_port(Some(42069)).await;
+        let (container, args) = amqp_test::start_rabbitmq_with_port(Some(42068)).await;
         let connection = AMQPConnection::connect(args).await?;
 
         let channel = connection.open_channel().await?;
