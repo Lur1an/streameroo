@@ -1,6 +1,8 @@
+use super::Handler;
 use super::connection::AMQPConnection;
-use super::{AMQPHandler, AMQPResult, Context};
-use crate::amqp::{Error, create_delivery_context};
+use super::handler::AMQPDecode;
+use crate::amqp::AMQPResult;
+use crate::amqp::context::create_delivery_context;
 use amqprs::channel::{
     BasicAckArguments, BasicConsumeArguments, BasicNackArguments, BasicQosArguments,
     ConsumerMessage,
@@ -11,23 +13,16 @@ use tokio::sync::Notify;
 use tokio::task::JoinSet;
 use tracing::Instrument;
 
-pub struct Consumer<H, P, T, Err> {
-    context: Arc<Context>,
+pub struct Consumer<H: Handler> {
     connection: AMQPConnection,
     consume_args: BasicConsumeArguments,
     qos_args: BasicQosArguments,
     handler: H,
     notifier: Arc<Notify>,
-    _phantom: std::marker::PhantomData<(P, T, Err)>,
 }
 
-impl<H, P, T, Err> Consumer<H, P, T, Err>
-where
-    H: AMQPHandler<P, T, Err>,
-    T: AMQPResult,
-{
+impl<H: Handler> Consumer<H> {
     pub fn new(
-        context: Arc<Context>,
         connection: AMQPConnection,
         options: BasicConsumeArguments,
         qos_args: BasicQosArguments,
@@ -35,13 +30,11 @@ where
         notifier: Arc<Notify>,
     ) -> Self {
         Self {
-            context,
             connection,
             consume_args: options,
             handler,
             qos_args,
             notifier,
-            _phantom: std::marker::PhantomData,
         }
     }
 
@@ -53,70 +46,77 @@ where
         skip_ack: bool,
         tasks: &mut JoinSet<()>,
     ) {
-        let (delivery_context, payload) = create_delivery_context(delivery, &self.context, channel);
+        let (ctx, payload) = create_delivery_context(delivery, channel);
         let handler = self.handler.clone();
 
         #[cfg(feature = "telemetry")]
-        let span = super::telemetry::make_span_from_delivery_context(&delivery_context);
+        let span = super::telemetry::make_span_from_delivery_context(&ctx);
         #[cfg(not(feature = "telemetry"))]
         let span = {
-            let delivery_tag = delivery_context.delivery_tag;
+            let delivery_tag = ctx.delivery_tag;
             tracing::span!(tracing::Level::INFO, "streameroo::consumer", delivery_tag)
         };
 
         let fut = async move {
-            match handler.call(payload, &delivery_context).await {
-                Ok(ret) => match ret.handle_result(&delivery_context).await {
-                    Ok(_) => {
-                        // On manual AMQPResult don't ack the result handling
-                        if skip_ack {
-                            return;
-                        }
-                        if let Err(e) = delivery_context
-                            .channel
-                            .basic_ack(BasicAckArguments {
-                                delivery_tag: delivery_context.delivery_tag,
-                                multiple: false,
-                            })
-                            .await
-                        {
-                            tracing::error!(?e, "Error acking delivery");
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(?e, "Error processing AMQPResult. Nacking delivery");
-                        let nack_args = BasicNackArguments {
-                            delivery_tag: delivery_context.delivery_tag,
-                            multiple: false,
-                            requeue: true,
-                        };
-                        if let Err(e) = delivery_context.channel.basic_nack(nack_args).await {
-                            tracing::error!(?e, "Error nacking delivery");
-                        }
-                    }
-                },
-                // Decoding an event failed, this would fail again if we nacked the
-                // delivery, so the framework automatically nacks without requeue!.
-                Err(Error::Event(e)) => {
-                    tracing::error!(?e, "Error decoding event. Nacking without requeue");
+            // Decode error → nack WITHOUT requeue (would fail again on retry)
+            let event = match H::Event::decode(payload, &ctx) {
+                Ok(event) => event,
+                Err(e) => {
+                    tracing::error!(%e, "Failed to decode event, nacking without requeue");
                     let nack_args = BasicNackArguments {
-                        delivery_tag: delivery_context.delivery_tag,
+                        delivery_tag: ctx.delivery_tag,
                         multiple: false,
                         requeue: false,
                     };
-                    if let Err(e) = delivery_context.channel.basic_nack(nack_args).await {
+                    if let Err(e) = ctx.channel.basic_nack(nack_args).await {
+                        tracing::error!(?e, "Error nacking delivery");
+                    }
+                    return;
+                }
+            };
+
+            // Handler error → nack WITH requeue
+            let result = match handler.handle(&ctx, event).await {
+                Ok(result) => result,
+                Err(e) => {
+                    tracing::error!(%e, "Handler error, nacking with requeue");
+                    let nack_args = BasicNackArguments {
+                        delivery_tag: ctx.delivery_tag,
+                        multiple: false,
+                        requeue: true,
+                    };
+                    if let Err(e) = ctx.channel.basic_nack(nack_args).await {
+                        tracing::error!(?e, "Error nacking delivery");
+                    }
+                    return;
+                }
+            };
+
+            // AMQPResult handling
+            match result.handle_result(&ctx).await {
+                Ok(_) => {
+                    if skip_ack {
+                        return;
+                    }
+                    if let Err(e) = ctx
+                        .channel
+                        .basic_ack(BasicAckArguments {
+                            delivery_tag: ctx.delivery_tag,
+                            multiple: false,
+                        })
+                        .await
+                    {
                         tracing::error!(?e, "Error acking delivery");
                     }
                 }
                 Err(e) => {
-                    tracing::error!(?e, "Error calling AMQP handler");
+                    tracing::error!(?e, "Error processing AMQPResult, nacking delivery");
                     let nack_args = BasicNackArguments {
-                        delivery_tag: delivery_context.delivery_tag,
+                        delivery_tag: ctx.delivery_tag,
                         multiple: false,
                         requeue: true,
                     };
-                    tracing::info!(?nack_args, "Nacking delivery");
-                    if let Err(e) = delivery_context.channel.basic_nack(nack_args).await {
+                    if let Err(e) = ctx.channel.basic_nack(nack_args).await {
                         tracing::error!(?e, "Error nacking delivery");
                     }
                 }
@@ -134,7 +134,7 @@ where
         tokio::pin!(notified);
 
         let mut tasks = JoinSet::new();
-        let skip_ack = T::manual() || self.consume_args.no_ack;
+        let skip_ack = H::Result::manual() || self.consume_args.no_ack;
         let mut channel;
         'outer: loop {
             tracing::info!("Creating channel for consumer");

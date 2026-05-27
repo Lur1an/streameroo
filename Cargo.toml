@@ -1,6 +1,6 @@
 [package]
 name = "streameroo"
-version = "0.4.4"
+version = "0.6.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/lur1an/streameroo"
@@ -8,37 +8,44 @@ keywords = ["amqp", "amqprs", "rabbitmq"]
 description = "Compilation of mini-frameworks & utilities for data-streaming applications"
 
 [dependencies]
-fnv = "1.0.7"
-uuid = { version = "1.11.0", features = ["v4"] }
+thiserror = "2.0.3"
+tracing = "0.1.41"
+
+# Codec dependencies (transport-agnostic)
 bytes = { version = "1.8.0", optional = true }
 rmp-serde = { version = "1.3.0", optional = true }
 serde = { version = "1.0.213", optional = true }
 serde_json = { version = "1.0.132", optional = true }
-tokio = { version = "1.40.0", features = ["full", "rt"], optional = true }
-thiserror = "2.0.3"
-tracing = "0.1.41"
-tokio-stream = "0.1.16"
 bson = { version = "2.13.0", optional = true }
-amqprs = { version = "2.1.1", features = ["urispec"]}
-opentelemetry = { version = "0.31", features = [ "trace", ], default-features = false, optional = true }
 
-testcontainers-modules = { version = "0.12.1", features = ["rabbitmq"], optional = true }
-test-context = { version = "0.3.0", optional = true }
+# AMQP dependencies
+amqprs = { version = "2.1.1", features = ["urispec"], optional = true }
+uuid = { version = "1.11.0", features = ["v4"], optional = true }
+tokio = { version = "1.40.0", features = ["full", "rt"], optional = true }
+tokio-stream = { version = "0.1.16", optional = true }
+
+# Telemetry dependencies
+opentelemetry = { version = "0.31", features = [ "trace", ], default-features = false, optional = true }
 tracing-opentelemetry-instrumentation-sdk = { version = "0.32.3", optional = true }
 tracing-opentelemetry = { version = "0.32.1", optional = true }
+
+# Test dependencies (optional, enabled via features)
+testcontainers-modules = { version = "0.12.1", features = ["rabbitmq"], optional = true }
+test-context = { version = "0.3.0", optional = true }
 
 [profile.release]
 panic = "abort"
 
 [features]
-default = ["tokio", "json"]
-tokio = ["dep:tokio"]
+default = ["amqp", "json"]
+amqp = ["dep:amqprs", "dep:uuid", "dep:tokio", "dep:tokio-stream"]
 msgpack = ["serde", "rmp-serde"]
 json = ["serde", "serde_json"]
 bson = ["dep:bson"]
 bytes = ["dep:bytes"]
-amqp-test = ["dep:testcontainers-modules", "dep:test-context"]
+amqp-test = ["amqp", "dep:testcontainers-modules", "dep:test-context"]
 telemetry = [
+    "amqp",
     "dep:opentelemetry",
     "dep:tracing-opentelemetry-instrumentation-sdk",
     "dep:tracing-opentelemetry"

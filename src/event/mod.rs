@@ -1,5 +1,4 @@
 use std::convert::Infallible;
-use std::fmt::Debug;
 
 pub trait Decode: Sized {
     type Error: std::error::Error + Send + Sync + 'static;
