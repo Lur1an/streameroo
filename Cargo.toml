@@ -4,7 +4,7 @@ version = "0.6.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/lur1an/streameroo"
-keywords = ["amqp", "amqprs", "rabbitmq"]
+keywords = ["amqp", "amqprs", "rabbitmq", "nats"]
 description = "Compilation of mini-frameworks & utilities for data-streaming applications"
 
 [dependencies]
@@ -24,10 +24,16 @@ uuid = { version = "1.11.0", features = ["v4"], optional = true }
 tokio = { version = "1.40.0", features = ["full", "rt"], optional = true }
 tokio-stream = { version = "0.1.16", optional = true }
 
+# NATS dependencies
+async-nats = { version = "0.49.0", optional = true }
+tokio-util = { version = "0.7.18", optional = true }
+chrono = { version = "0.4", features = ["serde"], optional = true }
+futures = { version = "0.3", optional = true }
+
 # Telemetry dependencies
-opentelemetry = { version = "0.31", features = [ "trace", ], default-features = false, optional = true }
-tracing-opentelemetry-instrumentation-sdk = { version = "0.32.3", optional = true }
-tracing-opentelemetry = { version = "0.32.1", optional = true }
+opentelemetry = { version = "0.32", features = [ "trace", ], default-features = false, optional = true }
+tracing-opentelemetry-instrumentation-sdk = { version = "0.38", optional = true }
+tracing-opentelemetry = { version = "0.33", optional = true }
 
 # Test dependencies (optional, enabled via features)
 testcontainers-modules = { version = "0.12.1", features = ["rabbitmq"], optional = true }
@@ -39,13 +45,13 @@ panic = "abort"
 [features]
 default = ["amqp", "json"]
 amqp = ["dep:amqprs", "dep:uuid", "dep:tokio", "dep:tokio-stream"]
-msgpack = ["serde", "rmp-serde"]
-json = ["serde", "serde_json"]
+nats = ["dep:async-nats", "dep:tokio", "dep:tokio-util", "dep:futures", "dep:chrono", "dep:serde", "dep:serde_json"]
+msgpack = ["dep:serde", "dep:rmp-serde"]
+json = ["dep:serde", "dep:serde_json"]
 bson = ["dep:bson"]
 bytes = ["dep:bytes"]
 amqp-test = ["amqp", "dep:testcontainers-modules", "dep:test-context"]
 telemetry = [
-    "amqp",
     "dep:opentelemetry",
     "dep:tracing-opentelemetry-instrumentation-sdk",
     "dep:tracing-opentelemetry"
@@ -57,4 +63,8 @@ nix = { version = "0.29.0", features = ["process", "signal"] }
 test-context = "0.3.0"
 testcontainers-modules = { version = "0.12.1", features = ["rabbitmq"] }
 tracing-subscriber = "0.3.19"
-init-tracing-opentelemetry = { version = "0.32.0", features = ["opentelemetry-otlp", "otlp", "tonic", "tracer", "tracing_subscriber_ext"] }
+init-tracing-opentelemetry = { version = "0.38", features = ["opentelemetry-otlp", "otlp", "tonic", "tracer", "tracing_subscriber_ext"] }
+fake-opentelemetry-collector = "0.38"
+insta = { version = "1", features = ["yaml", "redactions"] }
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "trace"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace"] }

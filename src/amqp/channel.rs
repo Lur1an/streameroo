@@ -52,7 +52,6 @@ pub trait ChannelExt {
 }
 
 impl ChannelExt for amqprs::channel::Channel {
-    #[tracing::instrument(name = "streameroo::amqp::direct_rpc", skip(self, timeout, event))]
     async fn direct_rpc<E, T>(
         &mut self,
         exchange: &str,
@@ -94,14 +93,6 @@ impl ChannelExt for amqprs::channel::Channel {
         tokio::time::timeout(timeout, fut).await?
     }
 
-    #[tracing::instrument(
-        name = "streameroo::amqp::publish_with_options",
-        skip(self, event),
-        fields(
-            exchange = args.exchange,
-            routing_key = args.routing_key
-        )
-    )]
     async fn publish_with_options<E>(
         &self,
         args: BasicPublishArguments,
@@ -163,14 +154,6 @@ impl ChannelExt for AMQPConnection {
             .await
     }
 
-    #[tracing::instrument(
-        name = "streameroo::amqp::publish_with_options",
-        skip(self, event),
-        fields(
-            exchange = args.exchange,
-            routing_key = args.routing_key
-        )
-    )]
     async fn publish_with_options<E>(
         &self,
         args: BasicPublishArguments,

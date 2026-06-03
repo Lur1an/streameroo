@@ -1,0 +1,117 @@
+---
+source: src/amqp/telemetry.rs
+expression: spans
+---
+- trace_id: "00000000000000000000000000000001"
+  span_id: "0000000000000003"
+  trace_state: ""
+  parent_span_id: "0000000000000002"
+  name: process telemetry-test-queue
+  kind: SPAN_KIND_CONSUMER
+  start_time_unix_nano: "[ts]"
+  end_time_unix_nano: "[ts]"
+  attributes:
+    busy_ns: "[ns]"
+    code.file.path: "Some(AnyValue { value: Some(StringValue(\"src/amqp/telemetry.rs\")) })"
+    code.line.number: "[code.line.number]"
+    code.module.name: "Some(AnyValue { value: Some(StringValue(\"streameroo::amqp::telemetry\")) })"
+    idle_ns: "[ns]"
+    messaging.destination.name: "Some(AnyValue { value: Some(StringValue(\"\")) })"
+    messaging.operation.name: "Some(AnyValue { value: Some(StringValue(\"process\")) })"
+    messaging.operation.type: "Some(AnyValue { value: Some(StringValue(\"process\")) })"
+    messaging.rabbitmq.content_type: "Some(AnyValue { value: Some(StringValue(\"application/json\")) })"
+    messaging.rabbitmq.destination.routing_key: "Some(AnyValue { value: Some(StringValue(\"telemetry-test-queue\")) })"
+    messaging.rabbitmq.message.delivery_tag: "Some(AnyValue { value: Some(IntValue(1)) })"
+    messaging.system: "Some(AnyValue { value: Some(StringValue(\"rabbitmq\")) })"
+    target: "Some(AnyValue { value: Some(StringValue(\"otel::tracing\")) })"
+    thread.id: "[thread.id]"
+    thread.name: "[thread.name]"
+  dropped_attributes_count: 0
+  events: []
+  dropped_events_count: 0
+  links: []
+  dropped_links_count: 0
+  status:
+    message: ""
+    code: STATUS_CODE_UNSET
+- trace_id: "00000000000000000000000000000001"
+  span_id: "0000000000000004"
+  trace_state: ""
+  parent_span_id: "0000000000000003"
+  name: handle_event
+  kind: SPAN_KIND_INTERNAL
+  start_time_unix_nano: "[ts]"
+  end_time_unix_nano: "[ts]"
+  attributes:
+    busy_ns: "[ns]"
+    code.file.path: "Some(AnyValue { value: Some(StringValue(\"src/amqp/telemetry.rs\")) })"
+    code.line.number: "[code.line.number]"
+    code.module.name: "Some(AnyValue { value: Some(StringValue(\"streameroo::amqp::telemetry::test\")) })"
+    idle_ns: "[ns]"
+    target: "Some(AnyValue { value: Some(StringValue(\"streameroo::amqp::telemetry::test\")) })"
+    thread.id: "[thread.id]"
+    thread.name: "[thread.name]"
+  dropped_attributes_count: 0
+  events: []
+  dropped_events_count: 0
+  links: []
+  dropped_links_count: 0
+  status:
+    message: ""
+    code: STATUS_CODE_UNSET
+- trace_id: "00000000000000000000000000000001"
+  span_id: "0000000000000001"
+  trace_state: ""
+  parent_span_id: ""
+  name: root
+  kind: SPAN_KIND_INTERNAL
+  start_time_unix_nano: "[ts]"
+  end_time_unix_nano: "[ts]"
+  attributes:
+    busy_ns: "[ns]"
+    code.file.path: "Some(AnyValue { value: Some(StringValue(\"src/amqp/telemetry.rs\")) })"
+    code.line.number: "[code.line.number]"
+    code.module.name: "Some(AnyValue { value: Some(StringValue(\"streameroo::amqp::telemetry::test\")) })"
+    idle_ns: "[ns]"
+    target: "Some(AnyValue { value: Some(StringValue(\"streameroo::amqp::telemetry::test\")) })"
+    thread.id: "[thread.id]"
+    thread.name: "[thread.name]"
+  dropped_attributes_count: 0
+  events: []
+  dropped_events_count: 0
+  links: []
+  dropped_links_count: 0
+  status:
+    message: ""
+    code: STATUS_CODE_UNSET
+- trace_id: "00000000000000000000000000000001"
+  span_id: "0000000000000002"
+  trace_state: ""
+  parent_span_id: "0000000000000001"
+  name: send telemetry-test-queue
+  kind: SPAN_KIND_PRODUCER
+  start_time_unix_nano: "[ts]"
+  end_time_unix_nano: "[ts]"
+  attributes:
+    busy_ns: "[ns]"
+    code.file.path: "Some(AnyValue { value: Some(StringValue(\"src/amqp/telemetry.rs\")) })"
+    code.line.number: "[code.line.number]"
+    code.module.name: "Some(AnyValue { value: Some(StringValue(\"streameroo::amqp::telemetry\")) })"
+    idle_ns: "[ns]"
+    messaging.destination.name: "Some(AnyValue { value: Some(StringValue(\"\")) })"
+    messaging.operation.name: "Some(AnyValue { value: Some(StringValue(\"send\")) })"
+    messaging.operation.type: "Some(AnyValue { value: Some(StringValue(\"send\")) })"
+    messaging.rabbitmq.content_type: "Some(AnyValue { value: Some(StringValue(\"application/json\")) })"
+    messaging.rabbitmq.destination.routing_key: "Some(AnyValue { value: Some(StringValue(\"telemetry-test-queue\")) })"
+    messaging.system: "Some(AnyValue { value: Some(StringValue(\"rabbitmq\")) })"
+    target: "Some(AnyValue { value: Some(StringValue(\"otel::tracing\")) })"
+    thread.id: "[thread.id]"
+    thread.name: "[thread.name]"
+  dropped_attributes_count: 0
+  events: []
+  dropped_events_count: 0
+  links: []
+  dropped_links_count: 0
+  status:
+    message: ""
+    code: STATUS_CODE_UNSET
