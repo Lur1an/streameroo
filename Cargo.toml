@@ -36,7 +36,7 @@ tracing-opentelemetry-instrumentation-sdk = { version = "0.38", optional = true 
 tracing-opentelemetry = { version = "0.33", optional = true }
 
 # Test dependencies (optional, enabled via features)
-testcontainers-modules = { version = "0.12.1", features = ["rabbitmq"], optional = true }
+testcontainers-modules = { version = "0.12.1", features = ["rabbitmq", "nats"], optional = true }
 test-context = { version = "0.3.0", optional = true }
 
 [profile.release]
@@ -45,12 +45,13 @@ panic = "abort"
 [features]
 default = ["amqp", "json"]
 amqp = ["dep:amqprs", "dep:uuid", "dep:tokio", "dep:tokio-stream"]
-nats = ["dep:async-nats", "dep:tokio", "dep:tokio-util", "dep:futures", "dep:chrono", "dep:serde", "dep:serde_json"]
+nats = ["dep:async-nats", "dep:tokio", "dep:tokio-util", "dep:futures", "dep:chrono", "dep:serde", "dep:serde_json", "dep:bytes"]
 msgpack = ["dep:serde", "dep:rmp-serde"]
 json = ["dep:serde", "dep:serde_json"]
 bson = ["dep:bson"]
 bytes = ["dep:bytes"]
 amqp-test = ["amqp", "dep:testcontainers-modules", "dep:test-context"]
+nats-test = ["nats", "dep:testcontainers-modules", "dep:test-context"]
 telemetry = [
     "dep:opentelemetry",
     "dep:tracing-opentelemetry-instrumentation-sdk",
@@ -59,9 +60,10 @@ telemetry = [
 
 [dev-dependencies]
 anyhow = "1.0.91"
+uuid = { version = "1.11.0", features = ["v4"] }
 nix = { version = "0.29.0", features = ["process", "signal"] }
 test-context = "0.3.0"
-testcontainers-modules = { version = "0.12.1", features = ["rabbitmq"] }
+testcontainers-modules = { version = "0.12.1", features = ["rabbitmq", "nats"] }
 tracing-subscriber = "0.3.19"
 init-tracing-opentelemetry = { version = "0.38", features = ["opentelemetry-otlp", "otlp", "tonic", "tracer", "tracing_subscriber_ext"] }
 fake-opentelemetry-collector = "0.38"
