@@ -11,6 +11,7 @@ use async_nats::HeaderMap;
 use async_nats::jetstream::Context;
 use async_nats::jetstream::stream::Config as StreamConfig;
 use bytes::Bytes;
+use std::time::Duration;
 
 /// Configuration for dead-lettering failed messages to a persistent stream.
 #[derive(Debug, Clone)]
@@ -19,6 +20,17 @@ pub struct DlqConfig {
     pub subject: String,
     /// Stream that captures the DLQ subject. Created if it does not exist.
     pub stream: StreamConfig,
+    /// When `Some`, streameroo ensures the DLQ stream's deduplication window
+    /// equals this value, enabling server-side deduplication of DLQ publishes
+    /// that share a `Nats-Msg-Id` (see [`publish_to_dlq`]). When `None`, the
+    /// window is left untouched and the server's default applies.
+    ///
+    /// This guards against double-publishing the same dead-lettered message
+    /// when a redelivery occurs (e.g. a lost publish/term ack). It must exceed
+    /// the worst-case redelivery span (`ack_wait × max_deliver` plus any
+    /// `backoff`) for deduplication to be reliable; streameroo does not
+    /// validate this.
+    pub duplicate_window: Option<Duration>,
 }
 
 /// The subject the original message was consumed from. Used for replay.
@@ -34,8 +46,15 @@ pub const DLQ_STREAM_SEQUENCE: &str = "Dlq-Stream-Sequence";
 /// RFC3339 timestamp of when the message was dead-lettered.
 pub const DLQ_DEAD_LETTERED_AT: &str = "Dlq-Dead-Lettered-At";
 
+/// JetStream's deduplication header. Setting it on a publish makes the server
+/// discard duplicates seen within the stream's `duplicate_window`.
+const NATS_MSG_ID: &str = "Nats-Msg-Id";
+
 /// Metadata describing why a message is being dead-lettered.
 pub(crate) struct DlqContext<'a> {
+    /// The name of the stream the original message was consumed from. Combined
+    /// with `stream_sequence` to form the deduplication id.
+    pub source_stream: &'a str,
     pub source_subject: &'a str,
     pub error: &'a str,
     pub retriable: bool,
@@ -63,12 +82,27 @@ pub(crate) async fn publish_to_dlq(
     headers.insert(DLQ_STREAM_SEQUENCE, ctx.stream_sequence.to_string());
     headers.insert(DLQ_DEAD_LETTERED_AT, chrono::Utc::now().to_rfc3339());
 
+    // Deterministic id derived from the original message's identity. A redelivery
+    // of the same message (e.g. after a lost publish/term ack) produces the same
+    // id, so the server deduplicates the re-publish within the stream's
+    // `duplicate_window` instead of writing a second DLQ entry.
+    let msg_id = format!("{}-{}", ctx.source_stream, ctx.stream_sequence);
+    headers.insert(NATS_MSG_ID, msg_id.as_str());
+
     // Double await: the first resolves once the publish is sent, the second
     // resolves once the server confirms the message was persisted to the DLQ
     // stream.
-    js.publish_with_headers(dlq_subject.to_owned(), headers, payload)
+    let ack = js
+        .publish_with_headers(dlq_subject.to_owned(), headers, payload)
         .await?
         .await?;
+
+    if ack.duplicate {
+        tracing::debug!(
+            %msg_id,
+            "DLQ publish deduplicated by server; message was already dead-lettered"
+        );
+    }
 
     Ok(())
 }

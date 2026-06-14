@@ -174,7 +174,20 @@ impl Streameroo {
 
         // Ensure the DLQ stream exists, if a DLQ is configured.
         if let Some(dlq) = &consumer_config.dlq {
-            self.js.get_or_create_stream(dlq.stream.clone()).await?;
+            let mut dlq_stream = dlq.stream.clone();
+            if let Some(window) = dlq.duplicate_window {
+                dlq_stream.duplicate_window = window;
+            }
+            let stream = self.js.get_or_create_stream(dlq_stream.clone()).await?;
+
+            // If we manage the dedup window and a pre-existing stream's window
+            // differs, reconcile it. (`get_or_create_stream` returns the existing
+            // config unchanged when the stream already exists.)
+            if let Some(window) = dlq.duplicate_window
+                && stream.cached_info().config.duplicate_window != window
+            {
+                self.js.update_stream(dlq_stream).await?;
+            }
         }
 
         // Create / fetch the durable pull consumer.
@@ -289,6 +302,7 @@ mod test {
                 retention: RetentionPolicy::Limits,
                 ..Default::default()
             },
+            duplicate_window: Some(Duration::from_secs(120)),
         }
     }
 
@@ -335,7 +349,7 @@ mod test {
         type Error = Infallible;
         async fn handle(
             &self,
-            ctx: &MessageContext,
+            ctx: &MessageContext<'_>,
             event: Json<TestEvent>,
         ) -> Result<(), Infallible> {
             assert_eq!(event.into_inner().0, "hello");
@@ -373,6 +387,30 @@ mod test {
         Ok(())
     }
 
+    #[test_context(NatsTest)]
+    #[tokio::test]
+    async fn test_jetstream_xpublish(ctx: &mut NatsTest) -> anyhow::Result<()> {
+        let subject = format!("test.{}", Uuid::new_v4().simple());
+        let (stream, consumer) = stream_and_consumer(&subject, 5, None);
+        let counter = Arc::new(AtomicU8::new(0));
+        ctx.app
+            .consume_sequential(
+                stream,
+                consumer,
+                SuccessHandler {
+                    counter: counter.clone(),
+                },
+            )
+            .await?;
+
+        // `xpublish` encodes the event, awaits the JetStream ack, and returns it.
+        let ack = ctx.js.xpublish(&subject, Json(TestEvent("hello".into()))).await?;
+        assert_eq!(ack.sequence, 1);
+
+        wait_for(&counter, 1, Duration::from_secs(10)).await;
+        Ok(())
+    }
+
     #[derive(Clone)]
     struct RetryHandler {
         counter: Arc<AtomicU8>,
@@ -382,7 +420,7 @@ mod test {
         type Error = RetriableError;
         async fn handle(
             &self,
-            _ctx: &MessageContext,
+            _ctx: &MessageContext<'_>,
             _event: Json<TestEvent>,
         ) -> Result<(), RetriableError> {
             let n = self.counter.fetch_add(1, Ordering::Relaxed);
@@ -427,7 +465,7 @@ mod test {
         type Error = PermanentError;
         async fn handle(
             &self,
-            _ctx: &MessageContext,
+            _ctx: &MessageContext<'_>,
             _event: Json<TestEvent>,
         ) -> Result<(), PermanentError> {
             Err(PermanentError)
@@ -491,6 +529,101 @@ mod test {
         Ok(())
     }
 
+    #[test_context(NatsTest)]
+    #[tokio::test]
+    async fn test_dlq_dedup_window_prevents_double_publish(
+        ctx: &mut NatsTest,
+    ) -> anyhow::Result<()> {
+        let subject = format!("test.{}", Uuid::new_v4().simple());
+        let dlq_subject = format!("dlq.{}", Uuid::new_v4().simple());
+        let dlq = dlq_config(&dlq_subject);
+        let dlq_stream_name = dlq.stream.name.clone();
+        let (stream, consumer) = stream_and_consumer(&subject, 5, Some(dlq));
+        // The dedup id is "{source_stream}-{stream_sequence}"; the first message
+        // published to the source stream has sequence 1.
+        let source_stream_name = stream.name.clone();
+
+        ctx.app
+            .consume_sequential(stream, consumer, PermanentFailHandler)
+            .await?;
+
+        ctx.js
+            .publish(
+                subject.clone(),
+                serde_json::to_vec(&TestEvent("poison".into()))?.into(),
+            )
+            .await?
+            .await?;
+
+        // Wait for the message to be dead-lettered.
+        let dlq_stream = ctx.js.get_stream(&dlq_stream_name).await?;
+        let dlq_consumer = dlq_stream
+            .get_or_create_consumer(
+                "dlq-reader",
+                PullConfig {
+                    durable_name: Some("dlq-reader".into()),
+                    ack_policy: AckPolicy::Explicit,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let mut messages = dlq_consumer.messages().await?;
+        let msg = tokio::time::timeout(Duration::from_secs(10), messages.next())
+            .await?
+            .expect("dlq stream closed")?;
+        msg.ack().await.ok();
+
+        // The DLQ stream must carry the configured dedup window so the server
+        // deduplicates re-publishes of the same dead-lettered message.
+        let mut dlq_stream = ctx.js.get_stream(&dlq_stream_name).await?;
+        let info = dlq_stream.info().await?;
+        assert_eq!(info.config.duplicate_window, Duration::from_secs(120));
+        assert_eq!(info.state.messages, 1);
+
+        // Simulate a redelivery re-publishing the same dead-lettered message:
+        // a publish carrying the same `Nats-Msg-Id` must be deduplicated.
+        let mut headers = async_nats::HeaderMap::new();
+        headers.insert("Nats-Msg-Id", format!("{source_stream_name}-1").as_str());
+        let ack = ctx
+            .js
+            .publish_with_headers(dlq_subject.clone(), headers, b"poison".to_vec().into())
+            .await?
+            .await?;
+        assert!(ack.duplicate, "re-publish should be deduplicated by server");
+
+        // The DLQ stream still holds exactly one message.
+        let info = dlq_stream.info().await?;
+        assert_eq!(info.state.messages, 1);
+        Ok(())
+    }
+
+    #[test_context(NatsTest)]
+    #[tokio::test]
+    async fn test_dlq_dedup_window_reconciled_on_mismatch(
+        ctx: &mut NatsTest,
+    ) -> anyhow::Result<()> {
+        let subject = format!("test.{}", Uuid::new_v4().simple());
+        let dlq_subject = format!("dlq.{}", Uuid::new_v4().simple());
+        let dlq = dlq_config(&dlq_subject);
+        let dlq_stream_name = dlq.stream.name.clone();
+
+        // Pre-create the DLQ stream with a different dedup window than configured.
+        let mut existing = dlq.stream.clone();
+        existing.duplicate_window = Duration::from_secs(30);
+        ctx.js.create_stream(existing).await?;
+
+        // Setting up the consumer must reconcile the window to the configured value.
+        let (stream, consumer) = stream_and_consumer(&subject, 5, Some(dlq));
+        ctx.app
+            .consume_sequential(stream, consumer, PermanentFailHandler)
+            .await?;
+
+        let mut dlq_stream = ctx.js.get_stream(&dlq_stream_name).await?;
+        let info = dlq_stream.info().await?;
+        assert_eq!(info.config.duplicate_window, Duration::from_secs(120));
+        Ok(())
+    }
+
     #[derive(Clone)]
     struct NeverCalledHandler {
         counter: Arc<AtomicU8>,
@@ -500,7 +633,7 @@ mod test {
         type Error = Infallible;
         async fn handle(
             &self,
-            _ctx: &MessageContext,
+            _ctx: &MessageContext<'_>,
             _event: Json<TestEvent>,
         ) -> Result<(), Infallible> {
             self.counter.fetch_add(1, Ordering::Relaxed);
@@ -600,7 +733,7 @@ mod test {
         type Error = Infallible;
         async fn handle(
             &self,
-            _ctx: &MessageContext,
+            _ctx: &MessageContext<'_>,
             _event: Json<TestEvent>,
         ) -> Result<(), Infallible> {
             // Small delay to encourage overlap between concurrent tasks.

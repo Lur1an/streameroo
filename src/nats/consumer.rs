@@ -12,6 +12,7 @@ use crate::event::Decode;
 use crate::nats::dlq::{self, DlqConfig};
 use crate::nats::handler::{Handler, HandlerError, MessageContext};
 use async_nats::jetstream::{self, AckKind};
+use tracing::Instrument;
 
 /// Handles a single message end-to-end: parse metadata, build a tracing span,
 /// then decode, dispatch, and acknowledge within it.
@@ -36,6 +37,7 @@ pub(crate) async fn process<H: Handler>(
     };
 
     let subject = msg.subject.as_str().to_owned();
+    let source_stream = info.stream.to_owned();
     let delivered = info.delivered;
     let stream_sequence = info.stream_sequence;
     let consumer_sequence = info.consumer_sequence;
@@ -63,22 +65,14 @@ pub(crate) async fn process<H: Handler>(
         js,
         dlq,
         &msg,
+        &source_stream,
         &subject,
         delivered,
         stream_sequence,
         consumer_sequence,
     );
 
-    #[cfg(feature = "telemetry")]
-    {
-        use tracing::Instrument;
-        fut.instrument(span).await
-    }
-    #[cfg(not(feature = "telemetry"))]
-    {
-        let _enter = span.enter();
-        fut.await
-    }
+    fut.instrument(span).await
 }
 
 /// Decodes, invokes the handler, and acknowledges. Takes the handler by value
@@ -89,6 +83,7 @@ async fn dispatch<H: Handler>(
     js: &jetstream::Context,
     dlq: Option<&DlqConfig>,
     msg: &jetstream::Message,
+    source_stream: &str,
     subject: &str,
     delivered: i64,
     stream_sequence: u64,
@@ -103,6 +98,7 @@ async fn dispatch<H: Handler>(
                 js,
                 dlq,
                 msg,
+                source_stream,
                 subject,
                 &e.to_string(),
                 false,
@@ -115,8 +111,8 @@ async fn dispatch<H: Handler>(
     };
 
     let ctx = MessageContext {
-        subject: subject.to_owned(),
-        headers: msg.headers.clone(),
+        subject,
+        headers: msg.headers.as_ref(),
         delivered,
         stream_sequence,
         consumer_sequence,
@@ -136,6 +132,7 @@ async fn dispatch<H: Handler>(
                 js,
                 dlq,
                 msg,
+                source_stream,
                 subject,
                 &e.to_string(),
                 false,
@@ -156,6 +153,7 @@ async fn dead_letter(
     js: &jetstream::Context,
     dlq: Option<&DlqConfig>,
     msg: &jetstream::Message,
+    source_stream: &str,
     subject: &str,
     error: &str,
     retriable: bool,
@@ -164,6 +162,7 @@ async fn dead_letter(
 ) {
     if let Some(dlq) = dlq {
         let ctx = dlq::DlqContext {
+            source_stream,
             source_subject: subject,
             error,
             retriable,

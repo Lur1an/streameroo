@@ -22,11 +22,15 @@ pub trait HandlerError: Display + Send + 'static {
 }
 
 /// Metadata about a JetStream message passed to a [`Handler`].
-pub struct MessageContext {
+///
+/// The context borrows the subject and headers from the underlying message,
+/// avoiding a clone on every dispatch. It is only valid for the duration of the
+/// [`Handler::handle`] call.
+pub struct MessageContext<'a> {
     /// The subject the message was published to.
-    pub subject: String,
+    pub subject: &'a str,
     /// The message headers, if any.
-    pub headers: Option<HeaderMap>,
+    pub headers: Option<&'a HeaderMap>,
     /// Number of times this message has been delivered (1 on first delivery).
     pub delivered: i64,
     /// The message's sequence number within the stream.
@@ -49,7 +53,7 @@ pub trait Handler {
 
     fn handle(
         &self,
-        ctx: &MessageContext,
+        ctx: &MessageContext<'_>,
         event: Self::Event,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
