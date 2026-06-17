@@ -7,6 +7,7 @@
 //! subject stored in [`DLQ_SOURCE_SUBJECT`].
 
 use crate::nats::error::NatsResult;
+use crate::nats::handler::MessageContext;
 use async_nats::HeaderMap;
 use async_nats::jetstream::Context;
 use async_nats::jetstream::stream::Config as StreamConfig;
@@ -52,14 +53,9 @@ const NATS_MSG_ID: &str = "Nats-Msg-Id";
 
 /// Metadata describing why a message is being dead-lettered.
 pub(crate) struct DlqContext<'a> {
-    /// The name of the stream the original message was consumed from. Combined
-    /// with `stream_sequence` to form the deduplication id.
-    pub source_stream: &'a str,
-    pub source_subject: &'a str,
+    pub message: &'a MessageContext<'a>,
     pub error: &'a str,
     pub retriable: bool,
-    pub delivered: i64,
-    pub stream_sequence: u64,
 }
 
 /// Publishes a message to the DLQ subject and **awaits the JetStream ack**
@@ -75,18 +71,21 @@ pub(crate) async fn publish_to_dlq(
     ctx: DlqContext<'_>,
 ) -> NatsResult<()> {
     let mut headers = HeaderMap::new();
-    headers.insert(DLQ_SOURCE_SUBJECT, ctx.source_subject);
+    headers.insert(DLQ_SOURCE_SUBJECT, ctx.message.subject);
     headers.insert(DLQ_ERROR, ctx.error);
     headers.insert(DLQ_RETRIABLE, ctx.retriable.to_string());
-    headers.insert(DLQ_DELIVERED, ctx.delivered.to_string());
-    headers.insert(DLQ_STREAM_SEQUENCE, ctx.stream_sequence.to_string());
+    headers.insert(DLQ_DELIVERED, ctx.message.delivered.to_string());
+    headers.insert(DLQ_STREAM_SEQUENCE, ctx.message.stream_sequence.to_string());
     headers.insert(DLQ_DEAD_LETTERED_AT, chrono::Utc::now().to_rfc3339());
 
     // Deterministic id derived from the original message's identity. A redelivery
     // of the same message (e.g. after a lost publish/term ack) produces the same
     // id, so the server deduplicates the re-publish within the stream's
     // `duplicate_window` instead of writing a second DLQ entry.
-    let msg_id = format!("{}-{}", ctx.source_stream, ctx.stream_sequence);
+    let msg_id = format!(
+        "{}-{}",
+        ctx.message.source_stream, ctx.message.stream_sequence
+    );
     headers.insert(NATS_MSG_ID, msg_id.as_str());
 
     // Double await: the first resolves once the publish is sent, the second

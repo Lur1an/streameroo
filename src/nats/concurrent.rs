@@ -6,9 +6,8 @@
 //! need for a client-side semaphore. The handler is cloned per task and must
 //! therefore be `Clone`. Ordering is **not** guaranteed.
 
-use crate::nats::consumer;
 use crate::nats::dlq::DlqConfig;
-use crate::nats::handler::Handler;
+use crate::nats::handler::{self, Handler};
 use async_nats::jetstream::consumer::Consumer;
 use async_nats::jetstream::consumer::pull::Config as PullConsumerConfig;
 use futures::StreamExt;
@@ -67,7 +66,7 @@ impl<H: Handler + Clone + Send + 'static> QueueProcessor<H> {
                             let js = js.clone();
                             let dlq = dlq.clone();
                             tasks.spawn(async move {
-                                consumer::process(handler, &js, dlq.as_ref(), msg).await;
+                                handler::process(handler, &js, dlq.as_ref(), msg).await;
                             });
                             // Reap completed tasks eagerly so the set does not
                             // grow unbounded.

@@ -4,9 +4,8 @@
 //! handler is borrowed inline (never cloned, never moved into a sub-task) it
 //! does **not** need to be `Clone`. Ordering is guaranteed.
 
-use crate::nats::consumer;
 use crate::nats::dlq::DlqConfig;
-use crate::nats::handler::Handler;
+use crate::nats::handler::{self, Handler};
 use async_nats::jetstream::consumer::Consumer;
 use async_nats::jetstream::consumer::pull::Config as PullConsumerConfig;
 use futures::StreamExt;
@@ -61,7 +60,7 @@ impl<H: Handler + Send> SequentialProcessor<H> {
                         Ok(msg) => {
                             // Thread the handler through so it can be reused for
                             // the next message without requiring `Clone`.
-                            handler = consumer::process(handler, &js, dlq.as_ref(), msg).await;
+                            handler = handler::process(handler, &js, dlq.as_ref(), msg).await;
                         }
                         Err(e) => {
                             tracing::error!(%e, "Error receiving message from consumer");

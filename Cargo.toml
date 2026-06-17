@@ -51,7 +51,6 @@ json = ["dep:serde", "dep:serde_json"]
 bson = ["dep:bson"]
 bytes = ["dep:bytes"]
 amqp-test = ["amqp", "dep:testcontainers-modules", "dep:test-context"]
-nats-test = ["nats", "dep:testcontainers-modules", "dep:test-context"]
 telemetry = [
     "dep:opentelemetry",
     "dep:tracing-opentelemetry-instrumentation-sdk",
