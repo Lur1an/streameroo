@@ -21,11 +21,6 @@ pub struct DlqConfig {
     pub subject: String,
     /// Stream that captures the DLQ subject. Created if it does not exist.
     pub stream: StreamConfig,
-    /// When `Some`, streameroo ensures the DLQ stream's deduplication window
-    /// equals this value, enabling server-side deduplication of DLQ publishes
-    /// that share a `Nats-Msg-Id` (see [`publish_to_dlq`]). When `None`, the
-    /// window is left untouched and the server's default applies.
-    ///
     /// This guards against double-publishing the same dead-lettered message
     /// when a redelivery occurs (e.g. a lost publish/term ack). It must exceed
     /// the worst-case redelivery span (`ack_wait × max_deliver` plus any
@@ -52,9 +47,12 @@ pub const DLQ_DEAD_LETTERED_AT: &str = "Dlq-Dead-Lettered-At";
 const NATS_MSG_ID: &str = "Nats-Msg-Id";
 
 /// Metadata describing why a message is being dead-lettered.
-pub(crate) struct DlqContext<'a> {
+pub struct DlqContext<'a> {
     pub message: &'a MessageContext<'a>,
-    pub error: &'a str,
+    /// Display message for the last error that caused the message to get dead-lettered
+    pub error: String,
+    /// Whether a message had a retriable error or not.
+    /// Deserialization errors are non-retriable and get immediately dead-lettered.
     pub retriable: bool,
 }
 
@@ -71,6 +69,7 @@ pub(crate) async fn publish_to_dlq(
     ctx: DlqContext<'_>,
 ) -> NatsResult<()> {
     let mut headers = HeaderMap::new();
+
     headers.insert(DLQ_SOURCE_SUBJECT, ctx.message.subject);
     headers.insert(DLQ_ERROR, ctx.error);
     headers.insert(DLQ_RETRIABLE, ctx.retriable.to_string());

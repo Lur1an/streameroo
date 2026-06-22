@@ -46,8 +46,8 @@ mod msgpack {
     use std::ops::{Deref, DerefMut};
 
     use super::*;
-    use serde::de::DeserializeOwned;
     use serde::Serialize;
+    use serde::de::DeserializeOwned;
 
     #[derive(Debug)]
     pub struct MsgPack<E>(pub E);
@@ -108,8 +108,8 @@ mod json {
     use std::ops::{Deref, DerefMut};
 
     use super::*;
-    use serde::de::DeserializeOwned;
     use serde::Serialize;
+    use serde::de::DeserializeOwned;
 
     #[derive(Debug)]
     pub struct Json<E>(pub E);
@@ -190,8 +190,8 @@ mod streameroo_bson {
     use std::ops::{Deref, DerefMut};
 
     use super::*;
-    use serde::de::DeserializeOwned;
     use serde::Serialize;
+    use serde::de::DeserializeOwned;
 
     #[derive(Debug)]
     pub struct Bson<E>(pub E);

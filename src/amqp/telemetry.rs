@@ -144,10 +144,9 @@ pub fn make_span_from_properties(
 
 #[cfg(test)]
 mod test {
-    use crate::amqp::Streameroo;
-    use crate::amqp::connection::amqp_test::start_rabbitmq;
     use crate::amqp::connection::AMQPConnection;
-    use crate::amqp::{ChannelExt, DeliveryContext, Handler};
+    use crate::amqp::connection::amqp_test::start_rabbitmq;
+    use crate::amqp::{ChannelExt, DeliveryContext, Handler, Streameroo};
     use crate::event::Json;
     use crate::test_util::FakeTelemetry;
     use amqprs::channel::QueueDeclareArguments;

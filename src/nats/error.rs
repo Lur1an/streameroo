@@ -1,4 +1,5 @@
 use async_nats::jetstream::consumer::StreamError;
+use async_nats::jetstream::consumer::pull::MessagesError;
 use async_nats::jetstream::context::{CreateStreamError, PublishError};
 use async_nats::jetstream::stream::ConsumerError;
 
@@ -6,8 +7,7 @@ type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// A consumer was configured without a `durable_name`, which is required to
-    /// look up / create the durable consumer.
+    /// Configuration error for a consumer
     #[error("Invalid consumer configuration: {0}")]
     Config(&'static str),
 
@@ -34,6 +34,10 @@ pub enum Error {
     /// Failure opening the message stream for a consumer.
     #[error("JetStream message stream error: {0}")]
     Messages(#[from] StreamError),
+
+    /// Non-recoverable failure while pulling messages from a consumer.
+    #[error("JetStream consumer pull error: {0}")]
+    Pull(#[from] MessagesError),
 }
 
 impl Error {

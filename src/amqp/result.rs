@@ -1,5 +1,5 @@
-use amqprs::channel::{BasicAckArguments, BasicNackArguments, BasicPublishArguments};
 use amqprs::BasicProperties;
+use amqprs::channel::{BasicAckArguments, BasicNackArguments, BasicPublishArguments};
 use std::future::Future;
 
 use crate::amqp::context::DeliveryContext;
