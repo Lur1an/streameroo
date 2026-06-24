@@ -1,4 +1,11 @@
 services:
+  nats:
+    image: nats:2.10
+    command: ["-js", "-m", "8222"]
+    ports:
+      - "4222:4222" # client connections
+      - "8222:8222" # HTTP monitoring/health
+
   jaeger:
     image: jaegertracing/all-in-one:latest
     environment:

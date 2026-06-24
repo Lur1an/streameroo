@@ -1,0 +1,112 @@
+---
+source: src/nats/telemetry.rs
+expression: mine
+---
+- trace_id: "[trace_id]"
+  span_id: "[span_id]"
+  trace_state: ""
+  parent_span_id: "[parent_span_id]"
+  name: process telemetry.test
+  kind: SPAN_KIND_CONSUMER
+  start_time_unix_nano: "[ts]"
+  end_time_unix_nano: "[ts]"
+  attributes:
+    busy_ns: "[ns]"
+    code.file.path: "Some(AnyValue { value: Some(StringValue(\"src/nats/telemetry.rs\")) })"
+    code.line.number: "[code.line.number]"
+    code.module.name: "Some(AnyValue { value: Some(StringValue(\"streameroo::nats::telemetry\")) })"
+    idle_ns: "[ns]"
+    messaging.destination.name: "Some(AnyValue { value: Some(StringValue(\"telemetry.test\")) })"
+    messaging.operation.name: "Some(AnyValue { value: Some(StringValue(\"process\")) })"
+    messaging.operation.type: "Some(AnyValue { value: Some(StringValue(\"process\")) })"
+    messaging.system: "Some(AnyValue { value: Some(StringValue(\"nats\")) })"
+    target: "Some(AnyValue { value: Some(StringValue(\"otel::tracing\")) })"
+    thread.id: "[thread.id]"
+    thread.name: "[thread.name]"
+  dropped_attributes_count: 0
+  events: []
+  dropped_events_count: 0
+  links: []
+  dropped_links_count: 0
+  status:
+    message: ""
+    code: STATUS_CODE_UNSET
+- trace_id: "[trace_id]"
+  span_id: "[span_id]"
+  trace_state: ""
+  parent_span_id: "[parent_span_id]"
+  name: handle_event
+  kind: SPAN_KIND_INTERNAL
+  start_time_unix_nano: "[ts]"
+  end_time_unix_nano: "[ts]"
+  attributes:
+    busy_ns: "[ns]"
+    code.file.path: "Some(AnyValue { value: Some(StringValue(\"src/nats/telemetry.rs\")) })"
+    code.line.number: "[code.line.number]"
+    code.module.name: "Some(AnyValue { value: Some(StringValue(\"streameroo::nats::telemetry::test::integration\")) })"
+    idle_ns: "[ns]"
+    target: "Some(AnyValue { value: Some(StringValue(\"streameroo::nats::telemetry::test::integration\")) })"
+    thread.id: "[thread.id]"
+    thread.name: "[thread.name]"
+  dropped_attributes_count: 0
+  events: []
+  dropped_events_count: 0
+  links: []
+  dropped_links_count: 0
+  status:
+    message: ""
+    code: STATUS_CODE_UNSET
+- trace_id: "[trace_id]"
+  span_id: "[span_id]"
+  trace_state: ""
+  parent_span_id: "[parent_span_id]"
+  name: root
+  kind: SPAN_KIND_INTERNAL
+  start_time_unix_nano: "[ts]"
+  end_time_unix_nano: "[ts]"
+  attributes:
+    busy_ns: "[ns]"
+    code.file.path: "Some(AnyValue { value: Some(StringValue(\"src/nats/telemetry.rs\")) })"
+    code.line.number: "[code.line.number]"
+    code.module.name: "Some(AnyValue { value: Some(StringValue(\"streameroo::nats::telemetry::test::integration\")) })"
+    idle_ns: "[ns]"
+    target: "Some(AnyValue { value: Some(StringValue(\"streameroo::nats::telemetry::test::integration\")) })"
+    thread.id: "[thread.id]"
+    thread.name: "[thread.name]"
+  dropped_attributes_count: 0
+  events: []
+  dropped_events_count: 0
+  links: []
+  dropped_links_count: 0
+  status:
+    message: ""
+    code: STATUS_CODE_UNSET
+- trace_id: "[trace_id]"
+  span_id: "[span_id]"
+  trace_state: ""
+  parent_span_id: "[parent_span_id]"
+  name: send telemetry.test
+  kind: SPAN_KIND_PRODUCER
+  start_time_unix_nano: "[ts]"
+  end_time_unix_nano: "[ts]"
+  attributes:
+    busy_ns: "[ns]"
+    code.file.path: "Some(AnyValue { value: Some(StringValue(\"src/nats/telemetry.rs\")) })"
+    code.line.number: "[code.line.number]"
+    code.module.name: "Some(AnyValue { value: Some(StringValue(\"streameroo::nats::telemetry\")) })"
+    idle_ns: "[ns]"
+    messaging.destination.name: "Some(AnyValue { value: Some(StringValue(\"telemetry.test\")) })"
+    messaging.operation.name: "Some(AnyValue { value: Some(StringValue(\"send\")) })"
+    messaging.operation.type: "Some(AnyValue { value: Some(StringValue(\"send\")) })"
+    messaging.system: "Some(AnyValue { value: Some(StringValue(\"nats\")) })"
+    target: "Some(AnyValue { value: Some(StringValue(\"otel::tracing\")) })"
+    thread.id: "[thread.id]"
+    thread.name: "[thread.name]"
+  dropped_attributes_count: 0
+  events: []
+  dropped_events_count: 0
+  links: []
+  dropped_links_count: 0
+  status:
+    message: ""
+    code: STATUS_CODE_UNSET

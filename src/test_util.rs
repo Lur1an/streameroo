@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use fake_opentelemetry_collector::{ExportedSpan, FakeCollectorServer};
 use opentelemetry::trace::{SpanId, TraceId, TracerProvider};
-use opentelemetry_otlp::{SpanExporter, WithExportConfig, WithTonicConfig};
+use opentelemetry_otlp::{SpanExporter, WithExportConfig};
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::{IdGenerator, SdkTracerProvider};
 use tracing_subscriber::layer::SubscriberExt;

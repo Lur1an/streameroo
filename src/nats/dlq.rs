@@ -10,6 +10,7 @@ use crate::nats::error::NatsResult;
 use crate::nats::handler::MessageContext;
 use async_nats::HeaderMap;
 use async_nats::jetstream::Context;
+use async_nats::jetstream::publish::PublishAck;
 use async_nats::jetstream::stream::Config as StreamConfig;
 use bytes::Bytes;
 use std::time::Duration;
@@ -67,7 +68,7 @@ pub(crate) async fn publish_to_dlq(
     dlq_subject: &str,
     payload: Bytes,
     ctx: DlqContext<'_>,
-) -> NatsResult<()> {
+) -> NatsResult<PublishAck> {
     let mut headers = HeaderMap::new();
 
     headers.insert(DLQ_SOURCE_SUBJECT, ctx.message.subject);
@@ -102,5 +103,124 @@ pub(crate) async fn publish_to_dlq(
         );
     }
 
-    Ok(())
+    Ok(ack)
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::nats::test_util::NatsTest;
+    use async_nats::jetstream::stream::Config as StreamConfig;
+    use std::time::Duration;
+    use test_context::test_context;
+
+    /// Builds a `MessageContext` with the given identity for driving DLQ publishes.
+    fn message_ctx<'a>(
+        subject: &'a str,
+        source_stream: &'a str,
+        delivered: i64,
+        stream_sequence: u64,
+    ) -> MessageContext<'a> {
+        MessageContext {
+            subject,
+            source_stream,
+            headers: None,
+            delivered,
+            stream_sequence,
+            consumer_sequence: stream_sequence,
+        }
+    }
+
+    #[test_context(NatsTest)]
+    #[tokio::test]
+    async fn publish_sets_all_metadata_headers(ctx: &mut NatsTest) {
+        let names = ctx.names();
+        ctx.js
+            .create_stream(StreamConfig {
+                name: names.dlq_stream.clone(),
+                subjects: vec![names.dlq_subject.clone()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let message = message_ctx(&names.subject, &names.stream, 4, 42);
+        let dlq_ctx = DlqContext {
+            message: &message,
+            error: "boom".to_string(),
+            retriable: true,
+        };
+        let payload = Bytes::from_static(b"raw-payload");
+
+        publish_to_dlq(&ctx.js, &names.dlq_subject, payload.clone(), dlq_ctx)
+            .await
+            .expect("publish_to_dlq failed");
+
+        let drained = ctx
+            .drain_stream(&names.dlq_stream, 1, Duration::from_secs(5))
+            .await;
+        assert_eq!(drained.len(), 1);
+        let msg = &drained[0];
+        let headers = msg.headers.as_ref().expect("DLQ message must have headers");
+
+        assert_eq!(
+            headers.get(DLQ_SOURCE_SUBJECT).unwrap().as_str(),
+            names.subject
+        );
+        assert_eq!(headers.get(DLQ_ERROR).unwrap().as_str(), "boom");
+        assert_eq!(headers.get(DLQ_RETRIABLE).unwrap().as_str(), "true");
+        assert_eq!(headers.get(DLQ_DELIVERED).unwrap().as_str(), "4");
+        assert_eq!(headers.get(DLQ_STREAM_SEQUENCE).unwrap().as_str(), "42");
+        // Timestamp parses as RFC3339.
+        let ts = headers.get(DLQ_DEAD_LETTERED_AT).unwrap().as_str();
+        chrono::DateTime::parse_from_rfc3339(ts).expect("dead-lettered-at must be RFC3339");
+        // Deterministic dedup id derived from the original message identity.
+        assert_eq!(
+            headers.get("Nats-Msg-Id").unwrap().as_str(),
+            format!("{}-{}", names.stream, 42)
+        );
+        // Payload is preserved untouched.
+        assert_eq!(msg.payload, payload);
+    }
+
+    #[test_context(NatsTest)]
+    #[tokio::test]
+    async fn redelivery_is_deduplicated(ctx: &mut NatsTest) {
+        let names = ctx.names();
+        ctx.js
+            .create_stream(StreamConfig {
+                name: names.dlq_stream.clone(),
+                subjects: vec![names.dlq_subject.clone()],
+                // Window must exceed the gap between the two publishes below.
+                duplicate_window: Duration::from_secs(30),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let message = message_ctx(&names.subject, &names.stream, 1, 7);
+        let payload = Bytes::from_static(b"dup-payload");
+
+        // Publish the "same" dead-lettered message twice (as a redelivery would).
+        for _ in 0..2 {
+            let dlq_ctx = DlqContext {
+                message: &message,
+                error: "boom".to_string(),
+                retriable: false,
+            };
+            publish_to_dlq(&ctx.js, &names.dlq_subject, payload.clone(), dlq_ctx)
+                .await
+                .expect("publish_to_dlq failed");
+        }
+
+        // Only one entry should be persisted thanks to server-side dedup.
+        let drained = ctx
+            .drain_stream(&names.dlq_stream, 2, Duration::from_secs(2))
+            .await;
+        assert_eq!(
+            drained.len(),
+            1,
+            "duplicate DLQ publish was not deduplicated"
+        );
+    }
 }

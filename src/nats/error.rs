@@ -47,3 +47,32 @@ impl Error {
 }
 
 pub type NatsResult<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use std::assert_matches;
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("decode boom")]
+    struct DecodeBoom;
+
+    #[test]
+    fn event_wraps_into_event_variant() {
+        let err = Error::event(DecodeBoom);
+        assert_matches!(err, Error::Event(_));
+        assert_eq!(
+            err.to_string(),
+            "Event encoding/decoding error: decode boom"
+        );
+    }
+
+    #[test]
+    fn config_error_displays_message() {
+        let err = Error::Config("max_ack_pending must be 1");
+        assert_eq!(
+            err.to_string(),
+            "Invalid consumer configuration: max_ack_pending must be 1"
+        );
+    }
+}

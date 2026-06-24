@@ -4,7 +4,9 @@ mod error;
 mod extensions;
 mod handler;
 #[cfg(feature = "telemetry")]
-mod telemetry;
+pub(crate) mod telemetry;
+#[cfg(test)]
+mod test_util;
 
 pub use consumer::{Consumer, ConsumerConfig};
 pub use dlq::{

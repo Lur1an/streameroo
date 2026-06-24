@@ -7,7 +7,7 @@
 //! - [`Consumer::run_concurrent`] spawns a task per message. The handler is
 //!   cloned per task and must therefore be `Clone`; ordering is not guaranteed.
 //!
-//! Both racing a caller-supplied `shutdown` future against each pull so the
+//! Both race a caller-supplied `shutdown` future against each pull so the
 //! consumer stops promptly when shutdown is requested.
 
 use crate::event::Decode;
@@ -21,6 +21,7 @@ use async_nats::jetstream::stream::Config as StreamConfig;
 use async_nats::jetstream::{self, AckKind};
 use futures::StreamExt;
 use std::future::Future;
+use std::sync::Arc;
 use tokio::task::JoinSet;
 use tracing::Instrument;
 
@@ -40,9 +41,23 @@ pub struct ConsumerConfig {
 
 /// A durable JetStream consumer bound to a [`Handler`].
 pub struct Consumer<H> {
-    pub config: ConsumerConfig,
-    pub handler: H,
-    pub js: async_nats::jetstream::Context,
+    config: ConsumerConfig,
+    handler: H,
+    js: async_nats::jetstream::Context,
+}
+
+impl<H> Consumer<H> {
+    /// Creates a consumer from a JetStream context, configuration and handler.
+    ///
+    /// The stream and consumer are not touched until one of the `run_*` methods
+    /// is called.
+    pub fn new(js: async_nats::jetstream::Context, config: ConsumerConfig, handler: H) -> Self {
+        Self {
+            config,
+            handler,
+            js,
+        }
+    }
 }
 
 impl<H> Consumer<H>
@@ -99,7 +114,7 @@ where
                     break;
                 }
                 Some(msg) = messages.next() => {
-                    process_message_result_sequential(msg, &mut handler, &js, dlq.as_ref()).await?;
+                    process_message_result(msg, &mut handler, &js, dlq.as_ref()).await?;
                 }
                 else => {
                     tracing::warn!("Consumer message stream ended unexpectedly");
@@ -146,6 +161,7 @@ where
         // propagating any setup failure to the caller.
         let consumer = setup_consumer(&js, stream, dlq.as_ref(), config).await?;
         let mut messages = consumer.messages().await?;
+        let dlq = dlq.map(Arc::new);
 
         // Each message is handled on its own task. Concurrency is bounded by the
         // consumer's `max_ack_pending` (the server will not deliver more
@@ -170,7 +186,7 @@ where
                             let js = js.clone();
                             let dlq = dlq.clone();
                             tasks.spawn(async move {
-                                process(&mut handler, &js, dlq.as_ref(), msg).await;
+                                process(&mut handler, &js, dlq.as_deref(), msg).await;
                             });
                             // Reap completed tasks eagerly so the set does not
                             // grow unbounded.
@@ -242,7 +258,7 @@ async fn setup_consumer(
 
 /// Handles one item yielded by the consumer's message stream, borrowing the
 /// handler mutably so a sequential caller can reuse it without `Clone`.
-async fn process_message_result_sequential<H: Handler + Send>(
+async fn process_message_result<H: Handler + Send>(
     msg: Result<jetstream::Message, MessagesError>,
     handler: &mut H,
     js: &jetstream::Context,
@@ -394,5 +410,478 @@ async fn dispatch<H: Handler>(
 async fn ack(msg: &jetstream::Message, kind: AckKind) {
     if let Err(e) = msg.ack_with(kind).await {
         tracing::error!(%e, ?kind, "Failed to acknowledge message");
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::event::{Encode, Json};
+    use crate::nats::JetStreamExt;
+    use crate::nats::test_util::{Mode, NatsTest, TestEvent, TestHandler, wait_for};
+    use assert_matches::assert_matches;
+    use std::time::Duration;
+    use test_context::test_context;
+    use tokio::sync::oneshot;
+
+    /// Publishes a `TestEvent` to a subject and awaits the JetStream ack.
+    async fn publish(ctx: &NatsTest, subject: &str, msg: &str) {
+        ctx.js
+            .xpublish(subject, Json(TestEvent::new(msg)))
+            .await
+            .expect("publish failed");
+    }
+
+    #[test_context(NatsTest)]
+    #[tokio::test]
+    async fn sequential_processes_in_order(ctx: &mut NatsTest) {
+        let names = ctx.names();
+        ctx.ensure_stream(&names).await;
+        for m in ["a", "b", "c"] {
+            publish(ctx, &names.subject, m).await;
+        }
+
+        let handler = TestHandler::new(Mode::Succeed);
+        let consumer = Consumer {
+            config: ctx.consumer_config(&names, false),
+            handler: handler.clone(),
+            js: ctx.js.clone(),
+        };
+
+        let (tx, rx) = oneshot::channel();
+        let task = tokio::spawn(consumer.run_sequential(async move {
+            let _ = rx.await;
+        }));
+
+        wait_for(Duration::from_secs(5), || handler.handled().len() == 3).await;
+        let _ = tx.send(());
+        task.await.unwrap().expect("consumer returned an error");
+
+        assert_eq!(handler.handled(), vec!["a", "b", "c"]);
+    }
+
+    #[test_context(NatsTest)]
+    #[tokio::test]
+    async fn sequential_rejects_bad_max_ack_pending(ctx: &mut NatsTest) {
+        let names = ctx.names();
+        let mut config = ctx.consumer_config(&names, false);
+        config.config.max_ack_pending = 5;
+
+        let consumer = Consumer {
+            config,
+            handler: TestHandler::new(Mode::Succeed),
+            js: ctx.js.clone(),
+        };
+
+        let result = consumer.run_sequential(std::future::pending()).await;
+        assert_matches!(result, Err(Error::Config(_)));
+    }
+
+    #[test_context(NatsTest)]
+    #[tokio::test]
+    async fn concurrent_processes_all(ctx: &mut NatsTest) {
+        let names = ctx.names();
+        ctx.ensure_stream(&names).await;
+        let expected = ["m1", "m2", "m3", "m4", "m5"];
+        for m in expected {
+            publish(ctx, &names.subject, m).await;
+        }
+
+        let mut config = ctx.consumer_config(&names, false);
+        config.config.max_ack_pending = 10;
+
+        let handler = TestHandler::new(Mode::Succeed);
+        let consumer = Consumer {
+            config,
+            handler: handler.clone(),
+            js: ctx.js.clone(),
+        };
+
+        let (tx, rx) = oneshot::channel();
+        let task = tokio::spawn(consumer.run_concurrent(async move {
+            let _ = rx.await;
+        }));
+
+        wait_for(Duration::from_secs(5), || handler.handled().len() == 5).await;
+        let _ = tx.send(());
+        task.await.unwrap().expect("consumer returned an error");
+
+        let mut handled = handler.handled();
+        handled.sort();
+        let mut want: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
+        want.sort();
+        assert_eq!(handled, want);
+    }
+
+    #[test_context(NatsTest)]
+    #[tokio::test]
+    async fn retriable_error_redelivers(ctx: &mut NatsTest) {
+        let names = ctx.names();
+        ctx.ensure_stream(&names).await;
+        publish(ctx, &names.subject, "x").await;
+
+        // Fail retriably on the first delivery, succeed on the second.
+        let handler = TestHandler::new(Mode::RetryUntil(2));
+        let consumer = Consumer {
+            config: ctx.consumer_config(&names, false),
+            handler: handler.clone(),
+            js: ctx.js.clone(),
+        };
+
+        let (tx, rx) = oneshot::channel();
+        let task = tokio::spawn(consumer.run_sequential(async move {
+            let _ = rx.await;
+        }));
+
+        wait_for(Duration::from_secs(5), || handler.handled() == ["x"]).await;
+        let _ = tx.send(());
+        task.await.unwrap().expect("consumer returned an error");
+
+        assert!(
+            handler.call_count() >= 2,
+            "expected at least one redelivery, got {} calls",
+            handler.call_count()
+        );
+    }
+
+    #[test_context(NatsTest)]
+    #[tokio::test]
+    async fn always_retriable_caps_at_max_deliver(ctx: &mut NatsTest) {
+        let names = ctx.names();
+        ctx.ensure_stream(&names).await;
+        publish(ctx, &names.subject, "loop").await;
+
+        // max_deliver defaults to 3 in the harness; a perpetually-retriable
+        // handler should be invoked exactly that many times, then give up.
+        let handler = TestHandler::new(Mode::AlwaysRetriable);
+        let consumer = Consumer {
+            config: ctx.consumer_config(&names, false),
+            handler: handler.clone(),
+            js: ctx.js.clone(),
+        };
+
+        let (tx, rx) = oneshot::channel();
+        let task = tokio::spawn(consumer.run_sequential(async move {
+            let _ = rx.await;
+        }));
+
+        wait_for(Duration::from_secs(5), || handler.call_count() >= 3).await;
+        // Give the server a chance to (not) redeliver beyond max_deliver.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let _ = tx.send(());
+        task.await.unwrap().expect("consumer returned an error");
+
+        assert_eq!(handler.call_count(), 3);
+        assert!(handler.handled().is_empty());
+    }
+
+    #[test_context(NatsTest)]
+    #[tokio::test]
+    async fn non_retriable_error_dead_letters(ctx: &mut NatsTest) {
+        let names = ctx.names();
+        ctx.ensure_stream(&names).await;
+        publish(ctx, &names.subject, "bad").await;
+
+        let handler = TestHandler::new(Mode::NonRetriable);
+        let consumer = Consumer {
+            config: ctx.consumer_config(&names, true),
+            handler: handler.clone(),
+            js: ctx.js.clone(),
+        };
+
+        let (tx, rx) = oneshot::channel();
+        let task = tokio::spawn(consumer.run_sequential(async move {
+            let _ = rx.await;
+        }));
+
+        let dlq = ctx
+            .drain_stream(&names.dlq_stream, 1, Duration::from_secs(5))
+            .await;
+        let _ = tx.send(());
+        task.await.unwrap().expect("consumer returned an error");
+
+        assert_eq!(dlq.len(), 1, "expected one dead-lettered message");
+        let msg = &dlq[0];
+        let headers = msg.headers.as_ref().expect("DLQ message must have headers");
+        assert_eq!(
+            headers.get(crate::nats::DLQ_RETRIABLE).unwrap().as_str(),
+            "false"
+        );
+        assert_eq!(
+            headers.get(crate::nats::DLQ_SOURCE_SUBJECT).unwrap().as_str(),
+            names.subject
+        );
+        // Payload is preserved byte-for-byte.
+        let original = Json(TestEvent::new("bad")).encode().unwrap();
+        assert_eq!(msg.payload.to_vec(), original);
+        // Handler ran exactly once (terminated, never redelivered).
+        assert_eq!(handler.call_count(), 1);
+    }
+
+    #[test_context(NatsTest)]
+    #[tokio::test]
+    async fn decode_failure_dead_letters(ctx: &mut NatsTest) {
+        let names = ctx.names();
+        ctx.ensure_stream(&names).await;
+        // Publish a payload that is not valid JSON for TestEvent.
+        let garbage = b"this is not json".to_vec();
+        ctx.js
+            .publish(names.subject.clone(), garbage.clone().into())
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+
+        let handler = TestHandler::new(Mode::Succeed);
+        let consumer = Consumer {
+            config: ctx.consumer_config(&names, true),
+            handler: handler.clone(),
+            js: ctx.js.clone(),
+        };
+
+        let (tx, rx) = oneshot::channel();
+        let task = tokio::spawn(consumer.run_sequential(async move {
+            let _ = rx.await;
+        }));
+
+        let dlq = ctx
+            .drain_stream(&names.dlq_stream, 1, Duration::from_secs(5))
+            .await;
+        let _ = tx.send(());
+        task.await.unwrap().expect("consumer returned an error");
+
+        assert_eq!(dlq.len(), 1);
+        let msg = &dlq[0];
+        let headers = msg.headers.as_ref().unwrap();
+        assert_eq!(
+            headers.get(crate::nats::DLQ_RETRIABLE).unwrap().as_str(),
+            "false"
+        );
+        assert_eq!(msg.payload.to_vec(), garbage);
+        // The handler was never invoked because decoding failed first.
+        assert_eq!(handler.call_count(), 0);
+    }
+
+    #[test_context(NatsTest)]
+    #[tokio::test]
+    async fn non_retriable_without_dlq_terminates(ctx: &mut NatsTest) {
+        let names = ctx.names();
+        ctx.ensure_stream(&names).await;
+        publish(ctx, &names.subject, "drop-me").await;
+
+        let handler = TestHandler::new(Mode::NonRetriable);
+        let consumer = Consumer {
+            config: ctx.consumer_config(&names, false),
+            handler: handler.clone(),
+            js: ctx.js.clone(),
+        };
+
+        let (tx, rx) = oneshot::channel();
+        let task = tokio::spawn(consumer.run_sequential(async move {
+            let _ = rx.await;
+        }));
+
+        wait_for(Duration::from_secs(5), || handler.call_count() == 1).await;
+        // Ensure it is terminated, not redelivered.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let _ = tx.send(());
+        task.await.unwrap().expect("consumer returned an error");
+
+        assert_eq!(handler.call_count(), 1);
+    }
+
+    #[test_context(NatsTest)]
+    #[tokio::test]
+    async fn shutdown_stops_consumer(ctx: &mut NatsTest) {
+        let names = ctx.names();
+        let consumer = Consumer {
+            config: ctx.consumer_config(&names, false),
+            handler: TestHandler::new(Mode::Succeed),
+            js: ctx.js.clone(),
+        };
+
+        // An already-ready shutdown future should stop the consumer immediately.
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            consumer.run_concurrent(std::future::ready(())),
+        )
+        .await
+        .expect("consumer did not honor shutdown in time");
+
+        result.expect("consumer returned an error");
+    }
+
+    #[test_context(NatsTest)]
+    #[tokio::test]
+    async fn dlq_duplicate_window_is_reconciled(ctx: &mut NatsTest) {
+        let names = ctx.names();
+        ctx.ensure_stream(&names).await;
+
+        // Pre-create the DLQ stream with a 1s dedup window.
+        let pre = StreamConfig {
+            name: names.dlq_stream.clone(),
+            subjects: vec![names.dlq_subject.clone()],
+            duplicate_window: Duration::from_secs(1),
+            ..Default::default()
+        };
+        ctx.js.create_stream(pre).await.unwrap();
+
+        // Configure the consumer's DLQ to manage a 5s window; setup should
+        // reconcile the existing stream via update_stream.
+        let mut config = ctx.consumer_config(&names, true);
+        config.dlq.as_mut().unwrap().duplicate_window = Some(Duration::from_secs(5));
+
+        let consumer = Consumer {
+            config,
+            handler: TestHandler::new(Mode::Succeed),
+            js: ctx.js.clone(),
+        };
+        // Running with a ready shutdown still performs setup (stream creation +
+        // reconcile) before stopping.
+        consumer
+            .run_concurrent(std::future::ready(()))
+            .await
+            .expect("consumer returned an error");
+
+        let info = ctx
+            .js
+            .get_stream(&names.dlq_stream)
+            .await
+            .unwrap()
+            .info()
+            .await
+            .unwrap()
+            .config
+            .duplicate_window;
+        assert_eq!(info, Duration::from_secs(5));
+    }
+
+    #[test_context(NatsTest)]
+    #[tokio::test]
+    async fn consumer_deleted_returns_error(ctx: &mut NatsTest) {
+        let names = ctx.names();
+        ctx.ensure_stream(&names).await;
+
+        let mut config = ctx.consumer_config(&names, false);
+        config.config.max_ack_pending = 10;
+
+        let consumer = Consumer {
+            config,
+            handler: TestHandler::new(Mode::Succeed),
+            js: ctx.js.clone(),
+        };
+        let task = tokio::spawn(consumer.run_concurrent(std::future::pending::<()>()));
+
+        // Let the consumer get created and start pulling, then delete it.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        ctx.js
+            .get_stream(&names.stream)
+            .await
+            .unwrap()
+            .delete_consumer(&names.durable)
+            .await
+            .unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("consumer did not stop after deletion")
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "expected a non-recoverable error after consumer deletion"
+        );
+    }
+
+    /// With `max_ack_pending == 1`, a NAK'd message must be redelivered and
+    /// processed *before* the next message in the stream, so ordering survives
+    /// retries. Here every message fails retriably on its first delivery and
+    /// succeeds on the second; the handled order must still match the publish
+    /// order.
+    #[test_context(NatsTest)]
+    #[tokio::test]
+    async fn sequential_preserves_order_with_nacks(ctx: &mut NatsTest) {
+        let names = ctx.names();
+        ctx.ensure_stream(&names).await;
+        let published = ["a", "b", "c", "d"];
+        for m in published {
+            publish(ctx, &names.subject, m).await;
+        }
+
+        // RetryUntil(2): NAK on delivery 1, succeed on delivery 2 for each message.
+        let handler = TestHandler::new(Mode::RetryUntil(2));
+        let consumer = Consumer::new(
+            ctx.js.clone(),
+            ctx.consumer_config(&names, false),
+            handler.clone(),
+        );
+
+        let (tx, rx) = oneshot::channel();
+        let task = tokio::spawn(consumer.run_sequential(async move {
+            let _ = rx.await;
+        }));
+
+        wait_for(Duration::from_secs(10), || handler.handled().len() == 4).await;
+        let _ = tx.send(());
+        task.await.unwrap().expect("consumer returned an error");
+
+        // Order is preserved despite every message being NAK'd once...
+        assert_eq!(handler.handled(), published);
+        // ...and each message really was delivered twice (4 messages x 2).
+        assert_eq!(handler.call_count(), 8);
+    }
+
+    /// Two sequential consumers bound to the *same* durable form a competing
+    /// pull group. Because the shared durable enforces `max_ack_pending == 1`,
+    /// only one message is ever in flight across both consumers, so the globally
+    /// observed processing order still matches the stream order. The two
+    /// consumers share one handler (its `handled` buffer is `Arc`-backed and
+    /// shared across clones), so the resulting snapshot is the interleaved global
+    /// order.
+    #[test_context(NatsTest)]
+    #[tokio::test]
+    async fn two_sequential_consumers_preserve_global_order(ctx: &mut NatsTest) {
+        let names = ctx.names();
+        ctx.ensure_stream(&names).await;
+
+        let count = 12;
+        let expected: Vec<String> = (0..count).map(|i| i.to_string()).collect();
+        for m in &expected {
+            publish(ctx, &names.subject, m).await;
+        }
+
+        // Cloning shares the `handled`/`calls` Arcs, so both consumers append to
+        // a single ordered buffer.
+        let handler = TestHandler::new(Mode::Succeed);
+        let consumer_a = Consumer::new(
+            ctx.js.clone(),
+            ctx.consumer_config(&names, false),
+            handler.clone(),
+        );
+        let consumer_b = Consumer::new(
+            ctx.js.clone(),
+            ctx.consumer_config(&names, false),
+            handler.clone(),
+        );
+
+        let (tx_a, rx_a) = oneshot::channel();
+        let (tx_b, rx_b) = oneshot::channel();
+        let task_a = tokio::spawn(consumer_a.run_sequential(async move {
+            let _ = rx_a.await;
+        }));
+        let task_b = tokio::spawn(consumer_b.run_sequential(async move {
+            let _ = rx_b.await;
+        }));
+
+        wait_for(Duration::from_secs(15), || {
+            handler.handled().len() == count as usize
+        })
+        .await;
+        let _ = tx_a.send(());
+        let _ = tx_b.send(());
+        task_a.await.unwrap().expect("consumer A returned an error");
+        task_b.await.unwrap().expect("consumer B returned an error");
+
+        // No duplicates and strict global ordering across both consumers.
+        assert_eq!(handler.handled(), expected);
     }
 }

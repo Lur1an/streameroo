@@ -9,6 +9,7 @@ use crate::event::Decode;
 use async_nats::HeaderMap;
 use std::fmt::Display;
 use std::future::Future;
+use std::time::Duration;
 
 /// Errors returned by a [`Handler`] must declare whether they are retriable.
 ///
@@ -19,7 +20,28 @@ use std::future::Future;
 pub trait HandlerError: Display + Send + 'static {
     /// Whether the message should be retried. Return `false` for permanent
     /// failures (validation errors, unknown message types, etc.).
-    fn is_retriable(&self) -> bool;
+    fn action(&self) -> ErrorAction;
+}
+
+#[derive(Debug)]
+pub enum ErrorAction {
+    /// Retry the message. Acks with `AckKind::Nak(duration)`, with `duration`
+    /// determined from the backoff policy.
+    Retry,
+    /// Publish the message to the configured DLQ. Acks with `AckKind::Term`
+    Dlq,
+    /// Discard the message and don't requeue it. Acks with `AckKind::Term`.
+    Term,
+}
+
+#[derive(Debug)]
+pub enum BackoffPolicy {
+    /// Exponential backoff with a maximum of `max_backoff` nanoseconds.
+    Exponential { max_backoff: Duration },
+    /// Linear backoff with a maximum of `max_backoff` nanoseconds.
+    Linear { max_backoff: Duration },
+    /// No backoff
+    None,
 }
 
 /// Metadata about a JetStream message passed to a [`Handler`].
@@ -43,17 +65,11 @@ pub struct MessageContext<'a> {
 }
 
 /// Processes messages from a JetStream consumer.
-///
-/// The trait declares only the message type, error type, and the handling
-/// method. Lifecycle bounds are added when the handler is driven:
-/// - [`Consumer::run_sequential`](crate::nats::Consumer::run_sequential)
-///   requires `Handler + Send`,
-/// - [`Consumer::run_concurrent`](crate::nats::Consumer::run_concurrent)
-///   requires `Handler + Clone + Send + 'static`.
 pub trait Handler {
     /// The decoded message type.
     type Event: Decode + Send;
-    /// The error type, which declares its own retriability by implementing `HandlerError`
+    /// Error type of the handler function. Specifies how to handle errors by implementing
+    /// `HandlerError`
     type Error: HandlerError;
 
     fn handle(
