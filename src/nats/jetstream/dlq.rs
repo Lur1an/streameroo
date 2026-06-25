@@ -7,7 +7,7 @@
 //! subject stored in [`DLQ_SOURCE_SUBJECT`].
 
 use crate::nats::error::NatsResult;
-use crate::nats::handler::MessageContext;
+use crate::nats::jetstream::handler::MessageContext;
 use async_nats::HeaderMap;
 use async_nats::jetstream::Context;
 use async_nats::jetstream::publish::PublishAck;
@@ -163,22 +163,45 @@ mod test {
         let msg = &drained[0];
         let headers = msg.headers.as_ref().expect("DLQ message must have headers");
 
+        // Snapshot the full header map, redacting the fields that vary per run:
+        // the UUID-suffixed subject / dedup id and the wall-clock timestamp. The
+        // timestamp is asserted individually below. `sort_maps` makes the output
+        // deterministic regardless of header iteration order.
+        insta::with_settings!({sort_maps => true}, {
+            insta::assert_yaml_snapshot!(headers, {
+                r#"["Dlq-Source-Subject"][0]"# => "[subject]",
+                r#"["Nats-Msg-Id"][0]"# => "[msg-id]",
+                r#"["Dlq-Dead-Lettered-At"][0]"# => "[timestamp]",
+            }, @r#"
+            Dlq-Dead-Lettered-At:
+              - "[timestamp]"
+            Dlq-Delivered:
+              - "4"
+            Dlq-Error:
+              - boom
+            Dlq-Retriable:
+              - "true"
+            Dlq-Source-Subject:
+              - "[subject]"
+            Dlq-Stream-Sequence:
+              - "42"
+            Nats-Msg-Id:
+              - "[msg-id]"
+            "#);
+        });
+
+        // The redacted dynamic fields are checked concretely here.
         assert_eq!(
             headers.get(DLQ_SOURCE_SUBJECT).unwrap().as_str(),
             names.subject
         );
-        assert_eq!(headers.get(DLQ_ERROR).unwrap().as_str(), "boom");
-        assert_eq!(headers.get(DLQ_RETRIABLE).unwrap().as_str(), "true");
-        assert_eq!(headers.get(DLQ_DELIVERED).unwrap().as_str(), "4");
-        assert_eq!(headers.get(DLQ_STREAM_SEQUENCE).unwrap().as_str(), "42");
-        // Timestamp parses as RFC3339.
-        let ts = headers.get(DLQ_DEAD_LETTERED_AT).unwrap().as_str();
-        chrono::DateTime::parse_from_rfc3339(ts).expect("dead-lettered-at must be RFC3339");
-        // Deterministic dedup id derived from the original message identity.
         assert_eq!(
             headers.get("Nats-Msg-Id").unwrap().as_str(),
             format!("{}-{}", names.stream, 42)
         );
+        // Timestamp parses as RFC3339.
+        let ts = headers.get(DLQ_DEAD_LETTERED_AT).unwrap().as_str();
+        chrono::DateTime::parse_from_rfc3339(ts).expect("dead-lettered-at must be RFC3339");
         // Payload is preserved untouched.
         assert_eq!(msg.payload, payload);
     }

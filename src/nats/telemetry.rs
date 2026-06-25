@@ -125,7 +125,7 @@ mod test {
     mod integration {
         use crate::event::Json;
         use crate::nats::test_util::{TestError, TestEvent, connect, wait_for};
-        use crate::nats::{Consumer, ConsumerConfig, Handler, JetStreamExt, MessageContext};
+        use crate::nats::jetstream::{self, Consumer, ConsumerConfig, Handler, MessageContext};
         use async_nats::jetstream::consumer::pull::Config as PullConfig;
         use async_nats::jetstream::stream::Config as StreamConfig;
         use fake_opentelemetry_collector::ExportedSpan;
@@ -177,7 +177,7 @@ mod test {
 
         /// Full publish -> consume flow over a real JetStream broker, asserting
         /// the W3C trace context propagates from the producer span (in
-        /// `JetStreamExt::xpublish`) to the consumer span (in `process`) via the
+        /// `jetstream::publish`) to the consumer span (in `process`) via the
         /// message headers.
         #[tokio::test(flavor = "multi_thread")]
         async fn publish_consume_trace_propagation() -> anyhow::Result<()> {
@@ -202,6 +202,7 @@ mod test {
             let handler = SignalHandler { done: done.clone() };
             let config = ConsumerConfig {
                 dlq: None,
+                backoff: Default::default(),
                 config: PullConfig {
                     durable_name: Some(DURABLE.to_string()),
                     filter_subject: SUBJECT.to_string(),
@@ -225,7 +226,7 @@ mod test {
             // Publish inside a root span so the producer span has a stable parent.
             {
                 let root = tracing::info_span!("root").entered();
-                js.xpublish(SUBJECT, Json(TestEvent::new("hello"))).await?;
+                jetstream::publish(&js, SUBJECT, Json(TestEvent::new("hello"))).await?;
                 drop(root);
             }
 

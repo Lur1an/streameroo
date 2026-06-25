@@ -1,18 +1,10 @@
-mod consumer;
-mod dlq;
 mod error;
 mod extensions;
-mod handler;
+pub mod jetstream;
 #[cfg(feature = "telemetry")]
 pub(crate) mod telemetry;
 #[cfg(test)]
 mod test_util;
 
-pub use consumer::{Consumer, ConsumerConfig};
-pub use dlq::{
-    DLQ_DEAD_LETTERED_AT, DLQ_DELIVERED, DLQ_ERROR, DLQ_RETRIABLE, DLQ_SOURCE_SUBJECT,
-    DLQ_STREAM_SEQUENCE, DlqConfig,
-};
 pub use error::{Error, NatsResult};
-pub use extensions::{ClientExt, JetStreamExt};
-pub use handler::{Handler, HandlerError, MessageContext};
+pub use extensions::ClientExt;

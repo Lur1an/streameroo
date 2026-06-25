@@ -6,7 +6,9 @@
 //! on teardown so the shared broker stays clean.
 
 use crate::event::Json;
-use crate::nats::{ConsumerConfig, DlqConfig, Handler, HandlerError, MessageContext};
+use crate::nats::jetstream::{
+    BackoffPolicy, ConsumerConfig, DlqConfig, ErrorAction, Handler, HandlerError, MessageContext,
+};
 use async_nats::jetstream::consumer::pull::Config as PullConfig;
 use async_nats::jetstream::stream::Config as StreamConfig;
 use serde::{Deserialize, Serialize};
@@ -114,6 +116,7 @@ impl NatsTest {
     pub fn consumer_config(&self, names: &TestNames, with_dlq: bool) -> ConsumerConfig {
         ConsumerConfig {
             dlq: with_dlq.then(|| self.dlq_config(names)),
+            backoff: BackoffPolicy::None,
             config: self.pull_config(names),
             stream: self.stream_config(names),
         }
@@ -210,11 +213,11 @@ impl TestEvent {
     }
 }
 
-/// Error returned by [`TestHandler`], carrying its own retriability.
+/// Error returned by [`TestHandler`], carrying the action it maps to.
 #[derive(Debug)]
 pub struct TestError {
     pub message: String,
-    pub retriable: bool,
+    pub action: ErrorAction,
 }
 
 impl fmt::Display for TestError {
@@ -224,8 +227,8 @@ impl fmt::Display for TestError {
 }
 
 impl HandlerError for TestError {
-    fn is_retriable(&self) -> bool {
-        self.retriable
+    fn action(&self) -> ErrorAction {
+        self.action
     }
 }
 
@@ -295,9 +298,14 @@ impl Handler for TestHandler {
             return Ok(());
         }
 
+        let action = match self.mode {
+            Mode::NonRetriable => ErrorAction::Dlq,
+            _ => ErrorAction::Retry,
+        };
+
         Err(TestError {
             message: format!("handler failed for {value:?}"),
-            retriable: !matches!(self.mode, Mode::NonRetriable),
+            action,
         })
     }
 }

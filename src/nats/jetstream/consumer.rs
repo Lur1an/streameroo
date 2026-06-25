@@ -11,8 +11,10 @@
 //! consumer stops promptly when shutdown is requested.
 
 use crate::event::Decode;
-use crate::nats::dlq::{self, DlqConfig};
-use crate::nats::handler::{Handler, HandlerError, MessageContext};
+use crate::nats::jetstream::dlq::{self, DlqConfig};
+use crate::nats::jetstream::handler::{
+    BackoffPolicy, ErrorAction, Handler, HandlerError, MessageContext,
+};
 use async_nats::jetstream::consumer::Consumer as JsConsumer;
 use async_nats::jetstream::consumer::pull::{
     Config as PullConsumerConfig, MessagesError, MessagesErrorKind,
@@ -25,7 +27,7 @@ use std::sync::Arc;
 use tokio::task::JoinSet;
 use tracing::Instrument;
 
-use super::Error;
+use crate::nats::Error;
 
 /// Configuration for a durable JetStream consumer.
 #[derive(Debug, Clone)]
@@ -33,6 +35,9 @@ pub struct ConsumerConfig {
     /// Optional dead-letter configuration. When `None`, non-retriable failures
     /// are terminated (`AckKind::Term`) and dropped.
     pub dlq: Option<DlqConfig>,
+    /// Backoff policy used to compute the NAK delay when a handler returns an
+    /// [`ErrorAction::Retry`] error. Defaults to [`BackoffPolicy::None`].
+    pub backoff: BackoffPolicy,
     /// The underlying pull consumer configuration. `durable_name` must be set.
     pub config: PullConsumerConfig,
     /// The stream configuration we're consuming from.
@@ -86,6 +91,7 @@ where
                 ConsumerConfig {
                     config,
                     dlq,
+                    backoff,
                     stream,
                 },
             mut handler,
@@ -114,7 +120,7 @@ where
                     break;
                 }
                 Some(msg) = messages.next() => {
-                    process_message_result(msg, &mut handler, &js, dlq.as_ref()).await?;
+                    process_message_result(msg, &mut handler, &js, dlq.as_ref(), backoff).await?;
                 }
                 else => {
                     tracing::warn!("Consumer message stream ended unexpectedly");
@@ -151,6 +157,7 @@ where
                 ConsumerConfig {
                     config,
                     dlq,
+                    backoff,
                     stream,
                 },
             handler,
@@ -186,7 +193,7 @@ where
                             let js = js.clone();
                             let dlq = dlq.clone();
                             tasks.spawn(async move {
-                                process(&mut handler, &js, dlq.as_deref(), msg).await;
+                                process(&mut handler, &js, dlq.as_deref(), backoff, msg).await;
                             });
                             // Reap completed tasks eagerly so the set does not
                             // grow unbounded.
@@ -263,10 +270,11 @@ async fn process_message_result<H: Handler + Send>(
     handler: &mut H,
     js: &jetstream::Context,
     dlq: Option<&DlqConfig>,
+    backoff: BackoffPolicy,
 ) -> Result<(), Error> {
     match msg {
         Ok(msg) => {
-            process(handler, js, dlq, msg).await;
+            process(handler, js, dlq, backoff, msg).await;
             Ok(())
         }
         Err(e) => classify_pull_error(e),
@@ -299,6 +307,7 @@ async fn process<H: Handler>(
     handler: &mut H,
     js: &jetstream::Context,
     dlq: Option<&DlqConfig>,
+    backoff: BackoffPolicy,
     msg: jetstream::Message,
 ) {
     let info = match msg.info() {
@@ -343,18 +352,25 @@ async fn process<H: Handler>(
         consumer_sequence,
     };
 
-    dispatch(handler, js, dlq, &msg, &ctx)
+    dispatch(handler, js, dlq, backoff, &msg, &ctx)
         .instrument(span)
         .await
 }
 
 /// Decode an event into the handler's event type, run the handler and ack the
-/// message.
-/// If the handler returns a non-retriable error, the message is dead-lettered
+/// message according to the [`ErrorAction`] of any returned error.
+///
+/// - [`ErrorAction::Retry`] NAKs with a delay computed from `backoff`.
+/// - [`ErrorAction::Dlq`] dead-letters (if a DLQ is configured) then terminates.
+/// - [`ErrorAction::Term`] terminates without redelivery.
+///
+/// A decode failure is always treated as a dead-letter (it can never succeed on
+/// redelivery).
 async fn dispatch<H: Handler>(
     handler: &mut H,
     js: &jetstream::Context,
     dlq: Option<&DlqConfig>,
+    backoff: BackoffPolicy,
     msg: &jetstream::Message,
     ctx: &MessageContext<'_>,
 ) {
@@ -362,48 +378,64 @@ async fn dispatch<H: Handler>(
         Ok(event) => event,
         Err(e) => {
             tracing::error!(%e, "Failed to decode message, dead-lettering");
-            if let Some(dlq) = dlq {
-                let dlq_ctx = dlq::DlqContext {
-                    message: ctx,
-                    error: e.to_string(),
-                    retriable: false,
-                };
-                if let Err(e) =
-                    dlq::publish_to_dlq(js, &dlq.subject, msg.payload.clone(), dlq_ctx).await
-                {
-                    tracing::error!(%e, "Failed to publish to DLQ, leaving message un-acked");
-                    return;
-                }
-            }
-            ack(msg, AckKind::Term).await;
+            dead_letter(js, dlq, msg, ctx, e.to_string()).await;
             return;
         }
     };
 
-    match handler.handle(ctx, event).await {
-        Ok(()) => ack(msg, AckKind::Ack).await,
-        Err(e) if e.is_retriable() => {
-            tracing::warn!(%e, delivered = ctx.delivered, "Retriable handler error, NAK'ing for redelivery");
-            ack(msg, AckKind::Nak(None)).await;
+    let error = match handler.handle(ctx, event).await {
+        Ok(()) => {
+            ack(msg, AckKind::Ack).await;
+            return;
         }
-        Err(e) => {
-            tracing::error!(%e, "Non-retriable handler error, dead-lettering");
-            if let Some(dlq) = dlq {
-                let dlq_ctx = dlq::DlqContext {
-                    message: ctx,
-                    error: e.to_string(),
-                    retriable: false,
-                };
-                if let Err(e) =
-                    dlq::publish_to_dlq(js, &dlq.subject, msg.payload.clone(), dlq_ctx).await
-                {
-                    tracing::error!(%e, "Failed to publish to DLQ, leaving message un-acked");
-                    return;
-                }
-            }
+        Err(e) => e,
+    };
+
+    match error.action() {
+        ErrorAction::Retry => {
+            let delay = backoff.nak_delay(ctx.delivered);
+            tracing::warn!(
+                %error,
+                delivered = ctx.delivered,
+                ?delay,
+                "Retriable handler error, NAK'ing for redelivery"
+            );
+            ack(msg, AckKind::Nak(delay)).await;
+        }
+        ErrorAction::Dlq => {
+            tracing::error!(%error, "Handler error, dead-lettering");
+            dead_letter(js, dlq, msg, ctx, error.to_string()).await;
+        }
+        ErrorAction::Term => {
+            tracing::error!(%error, "Handler error, terminating without redelivery");
             ack(msg, AckKind::Term).await;
         }
     }
+}
+
+/// Publishes the message to the DLQ (if configured) and then terminates it.
+///
+/// If the DLQ publish fails the message is left un-acked so it can be retried
+/// later rather than silently dropped.
+async fn dead_letter(
+    js: &jetstream::Context,
+    dlq: Option<&DlqConfig>,
+    msg: &jetstream::Message,
+    ctx: &MessageContext<'_>,
+    error: String,
+) {
+    if let Some(dlq) = dlq {
+        let dlq_ctx = dlq::DlqContext {
+            message: ctx,
+            error,
+            retriable: false,
+        };
+        if let Err(e) = dlq::publish_to_dlq(js, &dlq.subject, msg.payload.clone(), dlq_ctx).await {
+            tracing::error!(%e, "Failed to publish to DLQ, leaving message un-acked");
+            return;
+        }
+    }
+    ack(msg, AckKind::Term).await;
 }
 
 /// Acknowledges a message, logging any errors.
@@ -417,7 +449,6 @@ async fn ack(msg: &jetstream::Message, kind: AckKind) {
 mod test {
     use super::*;
     use crate::event::{Encode, Json};
-    use crate::nats::JetStreamExt;
     use crate::nats::test_util::{Mode, NatsTest, TestEvent, TestHandler, wait_for};
     use assert_matches::assert_matches;
     use std::time::Duration;
@@ -426,8 +457,7 @@ mod test {
 
     /// Publishes a `TestEvent` to a subject and awaits the JetStream ack.
     async fn publish(ctx: &NatsTest, subject: &str, msg: &str) {
-        ctx.js
-            .xpublish(subject, Json(TestEvent::new(msg)))
+        crate::nats::jetstream::publish(&ctx.js, subject, Json(TestEvent::new(msg)))
             .await
             .expect("publish failed");
     }
@@ -544,6 +574,52 @@ mod test {
         );
     }
 
+    /// A `Linear` backoff policy must delay the redelivery: the gap between the
+    /// first (failing) delivery and the second (succeeding) delivery should be
+    /// at least the policy's base delay. Without backoff the redelivery would be
+    /// nearly immediate.
+    #[test_context(NatsTest)]
+    #[tokio::test]
+    async fn backoff_delays_redelivery(ctx: &mut NatsTest) {
+        let names = ctx.names();
+        ctx.ensure_stream(&names).await;
+        publish(ctx, &names.subject, "x").await;
+
+        // NAK on delivery 1, succeed on delivery 2, with a 2s linear backoff so
+        // the redelivery is delayed by ~2s rather than the server default.
+        let mut config = ctx.consumer_config(&names, false);
+        config.backoff = BackoffPolicy::Linear {
+            base: Duration::from_secs(2),
+            max_backoff: Duration::from_secs(10),
+        };
+        // ack_wait must exceed the backoff so the delayed NAK, not an ack-wait
+        // timeout, drives the redelivery.
+        config.config.ack_wait = Duration::from_secs(10);
+
+        let handler = TestHandler::new(Mode::RetryUntil(2));
+        let consumer = Consumer {
+            config,
+            handler: handler.clone(),
+            js: ctx.js.clone(),
+        };
+
+        let started = std::time::Instant::now();
+        let (tx, rx) = oneshot::channel();
+        let task = tokio::spawn(consumer.run_sequential(async move {
+            let _ = rx.await;
+        }));
+
+        wait_for(Duration::from_secs(15), || handler.handled() == ["x"]).await;
+        let elapsed = started.elapsed();
+        let _ = tx.send(());
+        task.await.unwrap().expect("consumer returned an error");
+
+        assert!(
+            elapsed >= Duration::from_millis(1800),
+            "redelivery happened too quickly ({elapsed:?}); backoff delay was not applied"
+        );
+    }
+
     #[test_context(NatsTest)]
     #[tokio::test]
     async fn always_retriable_caps_at_max_deliver(ctx: &mut NatsTest) {
@@ -604,11 +680,11 @@ mod test {
         let msg = &dlq[0];
         let headers = msg.headers.as_ref().expect("DLQ message must have headers");
         assert_eq!(
-            headers.get(crate::nats::DLQ_RETRIABLE).unwrap().as_str(),
+            headers.get(crate::nats::jetstream::DLQ_RETRIABLE).unwrap().as_str(),
             "false"
         );
         assert_eq!(
-            headers.get(crate::nats::DLQ_SOURCE_SUBJECT).unwrap().as_str(),
+            headers.get(crate::nats::jetstream::DLQ_SOURCE_SUBJECT).unwrap().as_str(),
             names.subject
         );
         // Payload is preserved byte-for-byte.
@@ -654,7 +730,7 @@ mod test {
         let msg = &dlq[0];
         let headers = msg.headers.as_ref().unwrap();
         assert_eq!(
-            headers.get(crate::nats::DLQ_RETRIABLE).unwrap().as_str(),
+            headers.get(crate::nats::jetstream::DLQ_RETRIABLE).unwrap().as_str(),
             "false"
         );
         assert_eq!(msg.payload.to_vec(), garbage);
