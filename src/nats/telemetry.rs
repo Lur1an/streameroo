@@ -3,6 +3,21 @@ use opentelemetry::propagation::{Extractor, Injector};
 use opentelemetry::trace::SpanKind;
 use tracing_opentelemetry_instrumentation_sdk::otel_trace_span;
 
+/// Creates a producer span for `subject`, parents it to the current
+/// OpenTelemetry context, and injects the resulting trace context into
+/// `headers` so it propagates to consumers.
+pub fn inject_producer_context(subject: &str, headers: &mut HeaderMap) {
+    use opentelemetry::Context as OtelContext;
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+    use tracing_opentelemetry_instrumentation_sdk::find_context_from_tracing;
+
+    let span = make_span_for_subject(subject, SpanKind::Producer);
+    if let Err(e) = span.set_parent(OtelContext::current()) {
+        tracing::warn!("Failed to set parent context for span: {e}");
+    }
+    inject_context(&find_context_from_tracing(&span), headers);
+}
+
 pub struct HeaderInjector<'a>(pub &'a mut HeaderMap);
 
 impl<'a> Injector for HeaderInjector<'a> {
@@ -79,7 +94,7 @@ mod test {
             SpanId::from_bytes([0, 0, 0, 0, 0, 0, 0, 9]),
             TraceFlags::SAMPLED,
             true,
-            TraceState::default(),
+            TraceState::from_key_value([("foo", "bar")]).unwrap(),
         );
         let cx = Context::new().with_remote_span_context(span_context.clone());
 
@@ -91,7 +106,7 @@ mod test {
         );
         assert_eq!(
             headers.get("tracestate").map(|v| v.as_str()),
-            Some("")
+            Some("foo=bar")
         );
 
         let extracted = extract_context(&headers);
@@ -124,8 +139,8 @@ mod test {
 
     mod integration {
         use crate::event::Json;
+        use crate::nats::jetstream::{Consumer, ConsumerConfig, Handler, MessageContext, Producer};
         use crate::nats::test_util::{TestError, TestEvent, connect, wait_for};
-        use crate::nats::jetstream::{self, Consumer, ConsumerConfig, Handler, MessageContext};
         use async_nats::jetstream::consumer::pull::Config as PullConfig;
         use async_nats::jetstream::stream::Config as StreamConfig;
         use fake_opentelemetry_collector::ExportedSpan;
@@ -177,7 +192,7 @@ mod test {
 
         /// Full publish -> consume flow over a real JetStream broker, asserting
         /// the W3C trace context propagates from the producer span (in
-        /// `jetstream::publish`) to the consumer span (in `process`) via the
+        /// `Producer::produce`) to the consumer span (in `process`) via the
         /// message headers.
         #[tokio::test(flavor = "multi_thread")]
         async fn publish_consume_trace_propagation() -> anyhow::Result<()> {
@@ -226,7 +241,7 @@ mod test {
             // Publish inside a root span so the producer span has a stable parent.
             {
                 let root = tracing::info_span!("root").entered();
-                jetstream::publish(&js, SUBJECT, Json(TestEvent::new("hello"))).await?;
+                js.produce(SUBJECT, Json(TestEvent::new("hello"))).await?;
                 drop(root);
             }
 

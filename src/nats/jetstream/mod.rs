@@ -1,6 +1,5 @@
 //! JetStream primitives: durable consumers, the [`Handler`] contract,
-//! dead-letter queues and the codec-aware [`publish`]/[`publish_with_headers`]
-//! helpers.
+//! dead-letter queues and the codec-aware [`Producer`] extension trait.
 
 mod consumer;
 mod dlq;
@@ -13,4 +12,4 @@ pub use dlq::{
     DLQ_STREAM_SEQUENCE, DlqConfig,
 };
 pub use handler::{BackoffPolicy, ErrorAction, Handler, HandlerError, MessageContext};
-pub use producer::{publish, publish_with_headers};
+pub use producer::Producer;

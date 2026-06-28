@@ -6,52 +6,58 @@ use crate::nats::error::{Error, NatsResult};
 use async_nats::HeaderMap;
 use async_nats::jetstream::Context;
 use async_nats::jetstream::publish::PublishAck;
+use std::future::Future;
 
-/// Publishes an [`Encode`]-able message to a stream, awaiting the JetStream ack
-/// that confirms durable persistence.
-/// When the `telemetry` feature is enabled the current OpenTelemetry context
-/// is injected into the headers so it propagates to consumers.
-pub async fn publish<T: Encode>(js: &Context, subject: &str, message: T) -> NatsResult<PublishAck> {
-    publish_with_headers(js, subject, HeaderMap::new(), message).await
-}
-
-/// Publishes an [`Encode`]-able message to a stream with the given headers,
-/// awaiting the JetStream ack that confirms durable persistence.
-///
-/// When the `telemetry` feature is enabled the current OpenTelemetry context
-/// is injected into the headers so it propagates to consumers.
-pub async fn publish_with_headers<T: Encode>(
-    js: &Context,
-    subject: &str,
-    #[cfg_attr(not(feature = "telemetry"), allow(unused_mut))] mut headers: HeaderMap,
-    message: T,
-) -> NatsResult<PublishAck> {
-    let subject = subject.to_owned();
-    let payload = message.encode().map_err(Error::event)?;
-
-    #[cfg(feature = "telemetry")]
-    {
-        use crate::nats::telemetry;
-        use opentelemetry::Context as OtelContext;
-        use opentelemetry::trace::SpanKind;
-        use tracing_opentelemetry::OpenTelemetrySpanExt;
-        use tracing_opentelemetry_instrumentation_sdk::find_context_from_tracing;
-
-        let span = telemetry::make_span_for_subject(&subject, SpanKind::Producer);
-        if let Err(e) = span.set_parent(OtelContext::current()) {
-            tracing::warn!("Failed to set parent context for span: {e}");
-        }
-        telemetry::inject_context(&find_context_from_tracing(&span), &mut headers);
+/// Extension methods on the JetStream [`async_nats::jetstream::Context`].
+pub trait Producer {
+    /// Publishes an [`Encode`]-able message to a stream, awaiting the JetStream
+    /// ack that confirms durable persistence.
+    ///
+    /// When the `telemetry` feature is enabled the current OpenTelemetry context
+    /// is injected into the headers so it propagates to consumers.
+    fn produce<T: Encode>(
+        &self,
+        subject: &str,
+        message: T,
+    ) -> impl Future<Output = NatsResult<PublishAck>> {
+        self.produce_with_headers(subject, HeaderMap::new(), message)
     }
 
-    // Double await: the first resolves once the publish is sent, the second
-    // resolves once the server confirms the message was persisted.
-    let ack = js
-        .publish_with_headers(subject, headers, payload.into())
-        .await?
-        .await?;
+    /// Publishes an [`Encode`]-able message to a stream with the given headers,
+    /// awaiting the JetStream ack that confirms durable persistence.
+    ///
+    /// When the `telemetry` feature is enabled the current OpenTelemetry context
+    /// is injected into the headers so it propagates to consumers.
+    fn produce_with_headers<T: Encode>(
+        &self,
+        subject: &str,
+        headers: HeaderMap,
+        message: T,
+    ) -> impl Future<Output = NatsResult<PublishAck>>;
+}
 
-    Ok(ack)
+impl Producer for Context {
+    async fn produce_with_headers<T: Encode>(
+        &self,
+        subject: &str,
+        #[cfg_attr(not(feature = "telemetry"), allow(unused_mut))] mut headers: HeaderMap,
+        message: T,
+    ) -> NatsResult<PublishAck> {
+        let subject = subject.to_owned();
+        let payload = message.encode().map_err(Error::event)?;
+
+        #[cfg(feature = "telemetry")]
+        crate::nats::telemetry::inject_producer_context(&subject, &mut headers);
+
+        // Double await: the first resolves once the publish is sent, the second
+        // resolves once the server confirms the message was persisted.
+        let ack = self
+            .publish_with_headers(subject, headers, payload.into())
+            .await?
+            .await?;
+
+        Ok(ack)
+    }
 }
 
 #[cfg(test)]
@@ -85,7 +91,9 @@ mod test {
         let names = ctx.names();
         ctx.ensure_stream(&names).await;
 
-        let ack = publish(&ctx.js, &names.subject, Json(TestEvent::new("stored")))
+        let ack = ctx
+            .js
+            .produce(&names.subject, Json(TestEvent::new("stored")))
             .await
             .expect("jetstream publish failed");
         assert_eq!(ack.stream, names.stream);
@@ -114,9 +122,10 @@ mod test {
 
         let mut headers = HeaderMap::new();
         headers.insert("X-Js", "js-value");
-        publish_with_headers(&ctx.js, &names.subject, headers, Json(TestEvent::new("hh")))
+        ctx.js
+            .produce_with_headers(&names.subject, headers, Json(TestEvent::new("hh")))
             .await
-            .expect("jetstream publish_with_headers failed");
+            .expect("jetstream produce_with_headers failed");
 
         let drained = ctx
             .drain_stream(&names.stream, 1, Duration::from_secs(5))
@@ -131,7 +140,7 @@ mod test {
     async fn jetstream_publish_surfaces_encode_errors(ctx: &mut NatsTest) {
         let names = ctx.names();
         ctx.ensure_stream(&names).await;
-        let result = publish(&ctx.js, &names.subject, FailEncode).await;
+        let result = ctx.js.produce(&names.subject, FailEncode).await;
         assert_matches!(result, Err(Error::Event(_)));
     }
 }

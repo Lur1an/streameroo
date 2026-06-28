@@ -39,19 +39,7 @@ impl ClientExt for async_nats::Client {
         let payload = message.encode().map_err(Error::event)?;
 
         #[cfg(feature = "telemetry")]
-        {
-            use crate::nats::telemetry;
-            use opentelemetry::Context;
-            use opentelemetry::trace::SpanKind;
-            use tracing_opentelemetry::OpenTelemetrySpanExt;
-            use tracing_opentelemetry_instrumentation_sdk::find_context_from_tracing;
-
-            let span = telemetry::make_span_for_subject(&subject, SpanKind::Producer);
-            if let Err(e) = span.set_parent(Context::current()) {
-                tracing::warn!("Failed to set parent context for span: {e}");
-            }
-            telemetry::inject_context(&find_context_from_tracing(&span), &mut headers);
-        }
+        crate::nats::telemetry::inject_producer_context(&subject, &mut headers);
 
         self.publish_with_headers(subject, headers, payload.into())
             .await?;

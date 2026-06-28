@@ -38,21 +38,22 @@ pub enum ErrorAction {
 /// Determines the delay applied to a NAK before the server redelivers a
 /// retried message. The delay grows with the delivery count and is capped at
 /// `max_backoff`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub enum BackoffPolicy {
     /// Exponential backoff: `base * 2^(delivered - 1)`, capped at `max_backoff`.
-    Exponential { base: Duration, max_backoff: Duration },
+    Exponential {
+        base: Duration,
+        max_backoff: Duration,
+    },
     /// Linear backoff: `base * delivered`, capped at `max_backoff`.
-    Linear { base: Duration, max_backoff: Duration },
+    Linear {
+        base: Duration,
+        max_backoff: Duration,
+    },
     /// No backoff. The message is NAK'd without an explicit delay, letting the
     /// server apply its default redelivery timing.
+    #[default]
     None,
-}
-
-impl Default for BackoffPolicy {
-    fn default() -> Self {
-        BackoffPolicy::None
-    }
 }
 
 impl BackoffPolicy {
@@ -60,8 +61,6 @@ impl BackoffPolicy {
     /// times (1 on first delivery). Returns `None` for [`BackoffPolicy::None`],
     /// meaning the message should be NAK'd without an explicit delay.
     pub fn nak_delay(&self, delivered: i64) -> Option<Duration> {
-        // Treat the first delivery as attempt 1; never let the exponent or
-        // multiplier go below 1.
         let attempt = delivered.max(1) as u32;
         match self {
             BackoffPolicy::None => None,

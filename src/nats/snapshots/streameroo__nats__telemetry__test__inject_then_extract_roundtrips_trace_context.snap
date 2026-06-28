@@ -10,6 +10,13 @@ SpanContext {
     ),
     is_remote: true,
     trace_state: TraceState(
-        None,
+        Some(
+            [
+                (
+                    "foo",
+                    "bar",
+                ),
+            ],
+        ),
     ),
 }

@@ -289,7 +289,7 @@ fn classify_pull_error(e: MessagesError) -> Result<(), Error> {
         MessagesErrorKind::MissingHeartbeat
         | MessagesErrorKind::Pull
         | MessagesErrorKind::NoResponders => {
-            tracing::error!(%e, "Recoverable error on consumer");
+            tracing::debug!(%e, "Recoverable error on consumer");
             Ok(())
         }
         MessagesErrorKind::PushBasedConsumer
@@ -319,8 +319,7 @@ async fn process<H: Handler>(
         }
     };
 
-    let subject = msg.subject.as_str().to_owned();
-    let source_stream = info.stream.to_owned();
+    let subject = msg.subject.as_str();
     let delivered = info.delivered;
     let stream_sequence = info.stream_sequence;
     let consumer_sequence = info.consumer_sequence;
@@ -331,7 +330,7 @@ async fn process<H: Handler>(
         use opentelemetry::trace::SpanKind;
         use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-        let span = telemetry::make_span_for_subject(&subject, SpanKind::Consumer);
+        let span = telemetry::make_span_for_subject(subject, SpanKind::Consumer);
         if let Some(headers) = &msg.headers {
             let parent = telemetry::extract_context(headers);
             if let Err(e) = span.set_parent(parent) {
@@ -344,8 +343,8 @@ async fn process<H: Handler>(
     let span = tracing::info_span!("streameroo::nats::consume", %subject, delivered);
 
     let ctx = MessageContext {
-        subject: &subject,
-        source_stream: &source_stream,
+        subject,
+        source_stream: info.stream,
         headers: msg.headers.as_ref(),
         delivered,
         stream_sequence,
@@ -457,7 +456,9 @@ mod test {
 
     /// Publishes a `TestEvent` to a subject and awaits the JetStream ack.
     async fn publish(ctx: &NatsTest, subject: &str, msg: &str) {
-        crate::nats::jetstream::publish(&ctx.js, subject, Json(TestEvent::new(msg)))
+        use crate::nats::jetstream::Producer;
+        ctx.js
+            .produce(subject, Json(TestEvent::new(msg)))
             .await
             .expect("publish failed");
     }
@@ -680,11 +681,17 @@ mod test {
         let msg = &dlq[0];
         let headers = msg.headers.as_ref().expect("DLQ message must have headers");
         assert_eq!(
-            headers.get(crate::nats::jetstream::DLQ_RETRIABLE).unwrap().as_str(),
+            headers
+                .get(crate::nats::jetstream::DLQ_RETRIABLE)
+                .unwrap()
+                .as_str(),
             "false"
         );
         assert_eq!(
-            headers.get(crate::nats::jetstream::DLQ_SOURCE_SUBJECT).unwrap().as_str(),
+            headers
+                .get(crate::nats::jetstream::DLQ_SOURCE_SUBJECT)
+                .unwrap()
+                .as_str(),
             names.subject
         );
         // Payload is preserved byte-for-byte.
@@ -730,7 +737,10 @@ mod test {
         let msg = &dlq[0];
         let headers = msg.headers.as_ref().unwrap();
         assert_eq!(
-            headers.get(crate::nats::jetstream::DLQ_RETRIABLE).unwrap().as_str(),
+            headers
+                .get(crate::nats::jetstream::DLQ_RETRIABLE)
+                .unwrap()
+                .as_str(),
             "false"
         );
         assert_eq!(msg.payload.to_vec(), garbage);
