@@ -66,6 +66,12 @@ impl<H> Consumer<H> {
     }
 }
 
+/// Computes how often to send a working-ack (`AckKind::Progress`) while a
+/// handler is in flight, given the consumer's effective `ack_wait`.
+///
+/// Heartbeating at half of `ack_wait` keeps the delivery comfortably ahead of
+/// the server's redelivery deadline. A zero `ack_wait` (the protocol's "use the
+/// server default", 30s) is treated as 30s so we never busy-loop.
 fn heartbeat_interval(ack_wait: Duration) -> Duration {
     if ack_wait.is_zero() {
         Duration::from_secs(30)
@@ -79,9 +85,12 @@ where
     H: Handler + Send + 'static,
 {
     /// Processes one message at a time on the consumer task, in order.
-    /// Ensure that `config.max_ack_pending` is set to 1 or else
-    /// the consumer will not start with a config validation error,
-    /// as on NACK's the server does not redeliver the nacked message in order.
+    /// The consumer's *server-side* `max_ack_pending` must be 1 or this returns
+    /// a config validation error, because on a NAK the server does not redeliver
+    /// the nacked message ahead of later ones — more than one in-flight message
+    /// would break ordering. The check is against the value reported by the
+    /// server (authoritative even when the consumer is provisioned externally via
+    /// Kubernetes or the NATS CLI), not the locally-supplied config.
     /// Use this consumer when ordering is important for kafka-like message processing.
     ///
     /// `shutdown` is a future that resolves when the consumer should stop pulling
@@ -107,17 +116,23 @@ where
             js,
         } = self;
 
-        if config.max_ack_pending != 1 {
+        // Ensure the stream(s) exist and create / fetch the durable consumer,
+        // propagating any setup failure to the caller.
+        let consumer = setup_consumer(&js, stream, dlq.as_ref(), config).await?;
+
+        // Validate against the consumer's *server-side* config, which is
+        // authoritative even when the consumer is provisioned externally (e.g.
+        // Kubernetes or the NATS CLI) and the locally-supplied config differs.
+        let server_config = &consumer.cached_info().config;
+        if server_config.max_ack_pending != 1 {
             return Err(Error::Config(
                 "max_ack_pending must be 1 for sequential consumers",
             ));
         }
-
-        let handler_heartbeat_duration = heartbeat_interval(config.ack_wait);
-
-        // Ensure the stream(s) exist and create / fetch the durable consumer,
-        // propagating any setup failure to the caller.
-        let consumer = setup_consumer(&js, stream, dlq.as_ref(), config).await?;
+        // Derive the heartbeat from the server-side `ack_wait` for the same
+        // reason: it is correct even when `ack_wait` is set externally and left
+        // unset in code.
+        let handler_heartbeat_duration = heartbeat_interval(server_config.ack_wait);
         let mut messages = consumer.messages().await?;
 
         // Race the shutdown future against each pull so we stop promptly when
@@ -180,10 +195,15 @@ where
             js,
         } = self;
 
-        let handler_heartbeat_duration = heartbeat_interval(config.ack_wait);
         // Ensure the stream(s) exist and create / fetch the durable consumer,
         // propagating any setup failure to the caller.
         let consumer = setup_consumer(&js, stream, dlq.as_ref(), config).await?;
+        // Derive the heartbeat from the consumer's *server-side* `ack_wait`. This
+        // is authoritative even when the stream/consumer was provisioned
+        // externally (e.g. Kubernetes or the NATS CLI) and the locally-supplied
+        // config left `ack_wait` unset.
+        let handler_heartbeat_duration =
+            heartbeat_interval(consumer.cached_info().config.ack_wait);
         let mut messages = consumer.messages().await?;
         let dlq = dlq.map(Arc::new);
 
@@ -506,6 +526,8 @@ mod test {
     async fn sequential_rejects_bad_max_ack_pending(ctx: &mut NatsTest) {
         let names = ctx.names();
         let mut config = ctx.consumer_config(&names, false);
+        // The consumer is created from this config, so the server ends up with
+        // max_ack_pending = 5; the server-side check then rejects it.
         config.config.max_ack_pending = 5;
 
         let consumer = Consumer {
@@ -994,12 +1016,14 @@ mod test {
         publish(ctx, &names.subject, "slow").await;
 
         let mut config = ctx.consumer_config(&names, false);
-        config.config.ack_wait = Duration::from_secs(2); // heartbeat fires at 1s
+        // ack_wait of 4s => heartbeat at 2s, leaving a wide margin that stays
+        // reliable even under heavy parallel test load.
+        config.config.ack_wait = Duration::from_secs(4);
         config.config.max_ack_pending = 10; // concurrent path
 
-        // Handler sleeps 3x ack_wait. The heartbeat must hold the delivery open
-        // for the full duration; otherwise the server redelivers at ~2s.
-        let handler = TestHandler::new(Mode::SlowSucceed(Duration::from_secs(6)));
+        // Handler runs well past ack_wait. The heartbeat must hold the delivery
+        // open for the full duration; otherwise the server redelivers at ~4s.
+        let handler = TestHandler::new(Mode::SlowSucceed(Duration::from_secs(10)));
         let consumer = Consumer::new(ctx.js.clone(), config, handler.clone());
 
         let (tx, rx) = oneshot::channel();
@@ -1007,7 +1031,7 @@ mod test {
             let _ = rx.await;
         }));
 
-        wait_for(Duration::from_secs(20), || handler.handled().len() == 1).await;
+        wait_for(Duration::from_secs(25), || handler.handled().len() == 1).await;
         let _ = tx.send(());
         task.await.unwrap().expect("consumer returned an error");
 
@@ -1032,9 +1056,11 @@ mod test {
 
         // max_ack_pending stays 1 (the harness default) for the sequential path.
         let mut config = ctx.consumer_config(&names, false);
-        config.config.ack_wait = Duration::from_secs(2); // heartbeat fires at 1s
+        // ack_wait of 4s => heartbeat at 2s, leaving a wide margin that stays
+        // reliable even under heavy parallel test load.
+        config.config.ack_wait = Duration::from_secs(4);
 
-        let handler = TestHandler::new(Mode::SlowSucceed(Duration::from_secs(6)));
+        let handler = TestHandler::new(Mode::SlowSucceed(Duration::from_secs(10)));
         let consumer = Consumer::new(ctx.js.clone(), config, handler.clone());
 
         let (tx, rx) = oneshot::channel();
@@ -1042,7 +1068,7 @@ mod test {
             let _ = rx.await;
         }));
 
-        wait_for(Duration::from_secs(20), || handler.handled().len() == 1).await;
+        wait_for(Duration::from_secs(25), || handler.handled().len() == 1).await;
         let _ = tx.send(());
         task.await.unwrap().expect("consumer returned an error");
 
@@ -1052,5 +1078,147 @@ mod test {
             "slow handler was redelivered mid-flight"
         );
         assert_eq!(handler.handled(), ["slow"]);
+    }
+
+    /// The heartbeat interval is derived from the consumer's *server-side*
+    /// `ack_wait`, not the locally-supplied config — important when the
+    /// stream/consumer is provisioned externally (Kubernetes, NATS CLI) and the
+    /// caller leaves `ack_wait` unset.
+    ///
+    /// Here the consumer is pre-created on the server with `ack_wait = 4s`, but
+    /// the `ConsumerConfig` passed to `run_*` leaves `ack_wait` at zero. If the
+    /// heartbeat used the local value it would resolve to the 30s default and the
+    /// 10s handler would be redelivered at ~4s. Reading the server value yields a
+    /// 2s heartbeat, so the slow handler is processed exactly once.
+    #[test_context(NatsTest)]
+    #[tokio::test]
+    async fn heartbeat_uses_server_side_ack_wait(ctx: &mut NatsTest) {
+        let names = ctx.names();
+        ctx.ensure_stream(&names).await;
+        publish(ctx, &names.subject, "slow").await;
+
+        // Provision the durable consumer out-of-band with a 2s ack_wait, as an
+        // external orchestrator (k8s/CLI) would.
+        ctx.js
+            .get_stream(&names.stream)
+            .await
+            .unwrap()
+            .create_consumer(async_nats::jetstream::consumer::pull::Config {
+                durable_name: Some(names.durable.clone()),
+                filter_subject: names.subject.clone(),
+                ack_wait: Duration::from_secs(4),
+                max_deliver: 3,
+                max_ack_pending: 10,
+                ..Default::default()
+            })
+            .await
+            .expect("failed to pre-create consumer");
+
+        // Local config leaves ack_wait unset; setup_consumer will fetch the
+        // existing (server) config, which is what the heartbeat must use.
+        let mut config = ctx.consumer_config(&names, false);
+        config.config.ack_wait = Duration::ZERO;
+        config.config.max_ack_pending = 10;
+
+        let handler = TestHandler::new(Mode::SlowSucceed(Duration::from_secs(10)));
+        let consumer = Consumer::new(ctx.js.clone(), config, handler.clone());
+
+        let (tx, rx) = oneshot::channel();
+        let task = tokio::spawn(consumer.run_concurrent(async move {
+            let _ = rx.await;
+        }));
+
+        wait_for(Duration::from_secs(25), || handler.handled().len() == 1).await;
+        let _ = tx.send(());
+        task.await.unwrap().expect("consumer returned an error");
+
+        assert_eq!(
+            handler.call_count(),
+            1,
+            "heartbeat did not use the server-side ack_wait; handler was redelivered"
+        );
+        assert_eq!(handler.handled(), ["slow"]);
+    }
+
+    /// A sequential consumer must reject a consumer whose *server-side*
+    /// `max_ack_pending` is not 1, even when the local config claims a valid
+    /// value. This is the dangerous drift case: an externally-provisioned
+    /// consumer that allows >1 in-flight message would silently break ordering.
+    #[test_context(NatsTest)]
+    #[tokio::test]
+    async fn sequential_rejects_server_side_bad_max_ack_pending(ctx: &mut NatsTest) {
+        let names = ctx.names();
+        ctx.ensure_stream(&names).await;
+
+        // Provision the consumer out-of-band with max_ack_pending = 5.
+        ctx.js
+            .get_stream(&names.stream)
+            .await
+            .unwrap()
+            .create_consumer(async_nats::jetstream::consumer::pull::Config {
+                durable_name: Some(names.durable.clone()),
+                filter_subject: names.subject.clone(),
+                ack_wait: Duration::from_secs(2),
+                max_deliver: 3,
+                max_ack_pending: 5,
+                ..Default::default()
+            })
+            .await
+            .expect("failed to pre-create consumer");
+
+        // Local config claims the valid value of 1, but the server says 5.
+        let mut config = ctx.consumer_config(&names, false);
+        config.config.max_ack_pending = 1;
+
+        let consumer = Consumer::new(ctx.js.clone(), config, TestHandler::new(Mode::Succeed));
+        let result = consumer.run_sequential(std::future::pending()).await;
+        assert_matches!(result, Err(Error::Config(_)));
+    }
+
+    /// Conversely, a sequential consumer must *accept* a consumer whose
+    /// server-side `max_ack_pending` is 1 even when the local config carries a
+    /// different (would-be-invalid) value — proving the validation reads the
+    /// server, not the caller. The old client-side pre-check rejected this
+    /// valid, externally-provisioned setup.
+    #[test_context(NatsTest)]
+    #[tokio::test]
+    async fn sequential_accepts_server_side_max_ack_pending(ctx: &mut NatsTest) {
+        let names = ctx.names();
+        ctx.ensure_stream(&names).await;
+        publish(ctx, &names.subject, "x").await;
+
+        // Provision the consumer out-of-band, correctly, with max_ack_pending = 1.
+        ctx.js
+            .get_stream(&names.stream)
+            .await
+            .unwrap()
+            .create_consumer(async_nats::jetstream::consumer::pull::Config {
+                durable_name: Some(names.durable.clone()),
+                filter_subject: names.subject.clone(),
+                ack_wait: Duration::from_secs(2),
+                max_deliver: 3,
+                max_ack_pending: 1,
+                ..Default::default()
+            })
+            .await
+            .expect("failed to pre-create consumer");
+
+        // Local config carries a value the old pre-check would have rejected.
+        let mut config = ctx.consumer_config(&names, false);
+        config.config.max_ack_pending = 5;
+
+        let handler = TestHandler::new(Mode::Succeed);
+        let consumer = Consumer::new(ctx.js.clone(), config, handler.clone());
+
+        let (tx, rx) = oneshot::channel();
+        let task = tokio::spawn(consumer.run_sequential(async move {
+            let _ = rx.await;
+        }));
+
+        wait_for(Duration::from_secs(5), || handler.handled() == ["x"]).await;
+        let _ = tx.send(());
+        task.await.unwrap().expect("consumer returned an error");
+
+        assert_eq!(handler.handled(), ["x"]);
     }
 }
