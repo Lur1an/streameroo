@@ -24,6 +24,7 @@ use async_nats::jetstream::{self, AckKind};
 use futures::StreamExt;
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::task::JoinSet;
 use tracing::Instrument;
 
@@ -62,6 +63,14 @@ impl<H> Consumer<H> {
             handler,
             js,
         }
+    }
+}
+
+fn heartbeat_interval(ack_wait: Duration) -> Duration {
+    if ack_wait.is_zero() {
+        Duration::from_secs(30)
+    } else {
+        ack_wait / 2
     }
 }
 
@@ -104,6 +113,8 @@ where
             ));
         }
 
+        let handler_heartbeat_duration = heartbeat_interval(config.ack_wait);
+
         // Ensure the stream(s) exist and create / fetch the durable consumer,
         // propagating any setup failure to the caller.
         let consumer = setup_consumer(&js, stream, dlq.as_ref(), config).await?;
@@ -120,7 +131,12 @@ where
                     break;
                 }
                 Some(msg) = messages.next() => {
-                    process_message_result(msg, &mut handler, &js, dlq.as_ref(), backoff).await?;
+                    match msg {
+                        Ok(msg) => {
+                            process(&mut handler, &js, dlq.as_ref(), backoff, msg, handler_heartbeat_duration).await;
+                        }
+                        Err(e) => classify_pull_error(e)?,
+                    }
                 }
                 else => {
                     tracing::warn!("Consumer message stream ended unexpectedly");
@@ -164,6 +180,7 @@ where
             js,
         } = self;
 
+        let handler_heartbeat_duration = heartbeat_interval(config.ack_wait);
         // Ensure the stream(s) exist and create / fetch the durable consumer,
         // propagating any setup failure to the caller.
         let consumer = setup_consumer(&js, stream, dlq.as_ref(), config).await?;
@@ -193,7 +210,7 @@ where
                             let js = js.clone();
                             let dlq = dlq.clone();
                             tasks.spawn(async move {
-                                process(&mut handler, &js, dlq.as_deref(), backoff, msg).await;
+                                process(&mut handler, &js, dlq.as_deref(), backoff, msg, handler_heartbeat_duration).await;
                             });
                             // Reap completed tasks eagerly so the set does not
                             // grow unbounded.
@@ -263,24 +280,6 @@ async fn setup_consumer(
     Ok(consumer)
 }
 
-/// Handles one item yielded by the consumer's message stream, borrowing the
-/// handler mutably so a sequential caller can reuse it without `Clone`.
-async fn process_message_result<H: Handler + Send>(
-    msg: Result<jetstream::Message, MessagesError>,
-    handler: &mut H,
-    js: &jetstream::Context,
-    dlq: Option<&DlqConfig>,
-    backoff: BackoffPolicy,
-) -> Result<(), Error> {
-    match msg {
-        Ok(msg) => {
-            process(handler, js, dlq, backoff, msg).await;
-            Ok(())
-        }
-        Err(e) => classify_pull_error(e),
-    }
-}
-
 /// Classifies an error yielded by the consumer's message stream. Recoverable
 /// errors are logged and `Ok(())` is returned so the caller keeps consuming;
 /// non-recoverable errors are returned for the caller to stop on.
@@ -309,6 +308,7 @@ async fn process<H: Handler>(
     dlq: Option<&DlqConfig>,
     backoff: BackoffPolicy,
     msg: jetstream::Message,
+    handler_heartbeat_duration: Duration,
 ) {
     let info = match msg.info() {
         Ok(info) => info,
@@ -351,9 +351,19 @@ async fn process<H: Handler>(
         consumer_sequence,
     };
 
-    dispatch(handler, js, dlq, backoff, &msg, &ctx)
-        .instrument(span)
-        .await
+    let dispatch_fut = dispatch(handler, js, dlq, backoff, &msg, &ctx).instrument(span);
+    tokio::pin!(dispatch_fut);
+
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(handler_heartbeat_duration) => {
+                ack(&msg, AckKind::Progress).await;
+            }
+            result = &mut dispatch_fut => {
+                return result;
+            }
+        }
+    }
 }
 
 /// Decode an event into the handler's event type, run the handler and ack the
@@ -969,5 +979,78 @@ mod test {
 
         // No duplicates and strict global ordering across both consumers.
         assert_eq!(handler.handled(), expected);
+    }
+
+    /// A handler that runs ~4x longer than `ack_wait` must be kept alive by the
+    /// working-ack heartbeat (`AckKind::Progress` every `ack_wait / 2`) and
+    /// therefore handled exactly once on the concurrent path. With a broken
+    /// heartbeat the server would redeliver mid-handle, spawning a second task
+    /// and pushing `call_count` past 1.
+    #[test_context(NatsTest)]
+    #[tokio::test]
+    async fn slow_handler_is_not_redelivered_concurrent(ctx: &mut NatsTest) {
+        let names = ctx.names();
+        ctx.ensure_stream(&names).await;
+        publish(ctx, &names.subject, "slow").await;
+
+        let mut config = ctx.consumer_config(&names, false);
+        config.config.ack_wait = Duration::from_secs(2); // heartbeat fires at 1s
+        config.config.max_ack_pending = 10; // concurrent path
+
+        // Handler sleeps 3x ack_wait. The heartbeat must hold the delivery open
+        // for the full duration; otherwise the server redelivers at ~2s.
+        let handler = TestHandler::new(Mode::SlowSucceed(Duration::from_secs(6)));
+        let consumer = Consumer::new(ctx.js.clone(), config, handler.clone());
+
+        let (tx, rx) = oneshot::channel();
+        let task = tokio::spawn(consumer.run_concurrent(async move {
+            let _ = rx.await;
+        }));
+
+        wait_for(Duration::from_secs(20), || handler.handled().len() == 1).await;
+        let _ = tx.send(());
+        task.await.unwrap().expect("consumer returned an error");
+
+        assert_eq!(
+            handler.call_count(),
+            1,
+            "slow handler was redelivered mid-flight"
+        );
+        assert_eq!(handler.handled(), ["slow"]);
+    }
+
+    /// The sequential path makes the same guarantee: a handler slower than
+    /// `ack_wait` is heartbeated and handled exactly once. If the heartbeat
+    /// regressed, the redelivered copy would be processed after the first
+    /// (inline) handle returns, pushing `call_count` past 1.
+    #[test_context(NatsTest)]
+    #[tokio::test]
+    async fn slow_handler_is_not_redelivered_sequential(ctx: &mut NatsTest) {
+        let names = ctx.names();
+        ctx.ensure_stream(&names).await;
+        publish(ctx, &names.subject, "slow").await;
+
+        // max_ack_pending stays 1 (the harness default) for the sequential path.
+        let mut config = ctx.consumer_config(&names, false);
+        config.config.ack_wait = Duration::from_secs(2); // heartbeat fires at 1s
+
+        let handler = TestHandler::new(Mode::SlowSucceed(Duration::from_secs(6)));
+        let consumer = Consumer::new(ctx.js.clone(), config, handler.clone());
+
+        let (tx, rx) = oneshot::channel();
+        let task = tokio::spawn(consumer.run_sequential(async move {
+            let _ = rx.await;
+        }));
+
+        wait_for(Duration::from_secs(20), || handler.handled().len() == 1).await;
+        let _ = tx.send(());
+        task.await.unwrap().expect("consumer returned an error");
+
+        assert_eq!(
+            handler.call_count(),
+            1,
+            "slow handler was redelivered mid-flight"
+        );
+        assert_eq!(handler.handled(), ["slow"]);
     }
 }

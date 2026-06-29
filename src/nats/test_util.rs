@@ -237,6 +237,11 @@ impl HandlerError for TestError {
 pub enum Mode {
     /// Always succeed.
     Succeed,
+    /// Sleep for the given duration, then succeed. Exercises the working-ack
+    /// heartbeat (`AckKind::Progress`) for handlers that run longer than
+    /// `ack_wait`, which must keep the message in-flight rather than letting it
+    /// be redelivered mid-handle.
+    SlowSucceed(Duration),
     /// Fail retriably until `delivered >= n`, then succeed.
     RetryUntil(i64),
     /// Always fail with a retriable error (drives NAK / redelivery).
@@ -287,8 +292,12 @@ impl Handler for TestHandler {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let value = event.into_inner().0;
 
+        if let Mode::SlowSucceed(d) = &self.mode {
+            tokio::time::sleep(*d).await;
+        }
+
         let succeed = match self.mode {
-            Mode::Succeed => true,
+            Mode::Succeed | Mode::SlowSucceed(_) => true,
             Mode::RetryUntil(n) => ctx.delivered >= n,
             Mode::AlwaysRetriable | Mode::NonRetriable => false,
         };
