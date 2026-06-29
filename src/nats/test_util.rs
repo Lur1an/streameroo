@@ -246,8 +246,12 @@ pub enum Mode {
     RetryUntil(i64),
     /// Always fail with a retriable error (drives NAK / redelivery).
     AlwaysRetriable,
-    /// Always fail with a non-retriable error (drives dead-lettering).
+    /// Always fail with a non-retriable error mapped to [`ErrorAction::Dlq`]
+    /// (drives dead-lettering).
     NonRetriable,
+    /// Always fail with an error mapped to [`ErrorAction::Term`] (terminates the
+    /// message without redelivery or dead-lettering).
+    Terminate,
 }
 
 /// A configurable handler that records what it processes and how often it ran.
@@ -299,7 +303,7 @@ impl Handler for TestHandler {
         let succeed = match self.mode {
             Mode::Succeed | Mode::SlowSucceed(_) => true,
             Mode::RetryUntil(n) => ctx.delivered >= n,
-            Mode::AlwaysRetriable | Mode::NonRetriable => false,
+            Mode::AlwaysRetriable | Mode::NonRetriable | Mode::Terminate => false,
         };
 
         if succeed {
@@ -309,6 +313,7 @@ impl Handler for TestHandler {
 
         let action = match self.mode {
             Mode::NonRetriable => ErrorAction::Dlq,
+            Mode::Terminate => ErrorAction::Term,
             _ => ErrorAction::Retry,
         };
 

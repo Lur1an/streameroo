@@ -1221,4 +1221,173 @@ mod test {
 
         assert_eq!(handler.handled(), ["x"]);
     }
+
+    /// "Never lose a message": if the DLQ publish fails, the original message
+    /// must be left un-acked so the server redelivers it rather than dropping
+    /// it. Here the DLQ publish subject is captured by no stream, so every
+    /// dead-letter publish fails and the message must keep coming back.
+    #[test_context(NatsTest)]
+    #[tokio::test]
+    async fn dlq_publish_failure_leaves_message_unacked(ctx: &mut NatsTest) {
+        let names = ctx.names();
+        ctx.ensure_stream(&names).await;
+        publish(ctx, &names.subject, "bad").await;
+
+        // The DLQ stream exists but only listens on `dlq_subject`; we publish to
+        // an unrouted subject, so `publish_to_dlq` always fails (no responders).
+        let mut config = ctx.consumer_config(&names, true);
+        config.dlq = Some(DlqConfig {
+            subject: format!("unrouted.{}", names.dlq_stream),
+            stream: StreamConfig {
+                name: names.dlq_stream.clone(),
+                subjects: vec![names.dlq_subject.clone()],
+                ..Default::default()
+            },
+            duplicate_window: None,
+        });
+
+        let handler = TestHandler::new(Mode::NonRetriable);
+        let consumer = Consumer::new(ctx.js.clone(), config, handler.clone());
+
+        let (tx, rx) = oneshot::channel();
+        let task = tokio::spawn(consumer.run_sequential(async move {
+            let _ = rx.await;
+        }));
+
+        // The message is never acked, so the server redelivers it (up to the
+        // harness's max_deliver of 3). Seeing >1 delivery proves it wasn't
+        // dropped on the publish failure.
+        wait_for(Duration::from_secs(15), || handler.call_count() >= 2).await;
+        let _ = tx.send(());
+        task.await.unwrap().expect("consumer returned an error");
+
+        assert!(
+            handler.call_count() >= 2,
+            "message was not redelivered after a DLQ publish failure"
+        );
+        // Nothing should have been persisted to the DLQ stream.
+        let dlq = ctx
+            .drain_stream(&names.dlq_stream, 1, Duration::from_secs(2))
+            .await;
+        assert!(dlq.is_empty(), "no message should have reached the DLQ");
+        // The handler never succeeded.
+        assert!(handler.handled().is_empty());
+    }
+
+    /// The concurrent path must dead-letter handler failures too. All other
+    /// `run_concurrent` tests use `Mode::Succeed` or no DLQ, so the
+    /// `Arc`-wrapped DLQ dead-letter path is otherwise never exercised.
+    #[test_context(NatsTest)]
+    #[tokio::test]
+    async fn concurrent_dead_letters_on_handler_error(ctx: &mut NatsTest) {
+        let names = ctx.names();
+        ctx.ensure_stream(&names).await;
+        publish(ctx, &names.subject, "bad").await;
+
+        let mut config = ctx.consumer_config(&names, true);
+        config.config.max_ack_pending = 10;
+
+        let handler = TestHandler::new(Mode::NonRetriable);
+        let consumer = Consumer::new(ctx.js.clone(), config, handler.clone());
+
+        let (tx, rx) = oneshot::channel();
+        let task = tokio::spawn(consumer.run_concurrent(async move {
+            let _ = rx.await;
+        }));
+
+        let dlq = ctx
+            .drain_stream(&names.dlq_stream, 1, Duration::from_secs(5))
+            .await;
+        let _ = tx.send(());
+        task.await.unwrap().expect("consumer returned an error");
+
+        assert_eq!(dlq.len(), 1, "expected one dead-lettered message");
+        let headers = dlq[0]
+            .headers
+            .as_ref()
+            .expect("DLQ message must have headers");
+        assert_eq!(
+            headers
+                .get(crate::nats::jetstream::DLQ_SOURCE_SUBJECT)
+                .unwrap()
+                .as_str(),
+            names.subject
+        );
+        assert_eq!(handler.call_count(), 1);
+    }
+
+    /// `ErrorAction::Term` terminates the message: no redelivery and — crucially
+    /// — no dead-lettering even when a DLQ is configured.
+    #[test_context(NatsTest)]
+    #[tokio::test]
+    async fn term_action_terminates_without_dlq(ctx: &mut NatsTest) {
+        let names = ctx.names();
+        ctx.ensure_stream(&names).await;
+        publish(ctx, &names.subject, "term-me").await;
+
+        // A DLQ is configured precisely to prove Term does NOT publish to it.
+        let handler = TestHandler::new(Mode::Terminate);
+        let consumer =
+            Consumer::new(ctx.js.clone(), ctx.consumer_config(&names, true), handler.clone());
+
+        let (tx, rx) = oneshot::channel();
+        let task = tokio::spawn(consumer.run_sequential(async move {
+            let _ = rx.await;
+        }));
+
+        wait_for(Duration::from_secs(5), || handler.call_count() == 1).await;
+        // Give the server a chance to (not) redeliver.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let _ = tx.send(());
+        task.await.unwrap().expect("consumer returned an error");
+
+        // Handled once, never redelivered...
+        assert_eq!(handler.call_count(), 1);
+        assert!(handler.handled().is_empty());
+        // ...and nothing was dead-lettered.
+        let dlq = ctx
+            .drain_stream(&names.dlq_stream, 1, Duration::from_secs(2))
+            .await;
+        assert!(dlq.is_empty(), "Term must not publish to the DLQ");
+    }
+
+    /// A decode failure with no DLQ configured is terminated (silently dropped):
+    /// the handler is never invoked and the consumer keeps going with the next
+    /// message. Exercises the `dlq = None` silent-drop branch.
+    #[test_context(NatsTest)]
+    #[tokio::test]
+    async fn decode_failure_without_dlq_drops_silently(ctx: &mut NatsTest) {
+        let names = ctx.names();
+        ctx.ensure_stream(&names).await;
+        // An un-decodable payload, followed by a valid one.
+        ctx.js
+            .publish(names.subject.clone(), b"not json".to_vec().into())
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+        publish(ctx, &names.subject, "good").await;
+
+        let handler = TestHandler::new(Mode::Succeed);
+        let consumer = Consumer::new(
+            ctx.js.clone(),
+            ctx.consumer_config(&names, false),
+            handler.clone(),
+        );
+
+        let (tx, rx) = oneshot::channel();
+        let task = tokio::spawn(consumer.run_sequential(async move {
+            let _ = rx.await;
+        }));
+
+        // The garbage message is dropped without invoking the handler; the valid
+        // message that follows is processed, proving the consumer didn't stall.
+        wait_for(Duration::from_secs(5), || handler.handled() == ["good"]).await;
+        let _ = tx.send(());
+        task.await.unwrap().expect("consumer returned an error");
+
+        assert_eq!(handler.handled(), ["good"]);
+        // The handler ran exactly once — only for the valid message.
+        assert_eq!(handler.call_count(), 1);
+    }
 }
