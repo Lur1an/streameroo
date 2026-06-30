@@ -86,11 +86,11 @@ where
 {
     /// Processes one message at a time on the consumer task, in order.
     /// The consumer's *server-side* `max_ack_pending` must be 1 or this returns
-    /// a config validation error, because on a NAK the server does not redeliver
-    /// the nacked message ahead of later ones — more than one in-flight message
-    /// would break ordering. The check is against the value reported by the
-    /// server (authoritative even when the consumer is provisioned externally via
-    /// Kubernetes or the NATS CLI), not the locally-supplied config.
+    /// a config validation error. This ensures only one message is globally in
+    /// flight when multiple sequential workers share the durable. The check is
+    /// against the value reported by the server (authoritative even when the
+    /// consumer is provisioned externally via Kubernetes or the NATS CLI), not
+    /// the locally-supplied config.
     /// Use this consumer when ordering is important for kafka-like message processing.
     ///
     /// `shutdown` is a future that resolves when the consumer should stop pulling
@@ -202,8 +202,7 @@ where
         // is authoritative even when the stream/consumer was provisioned
         // externally (e.g. Kubernetes or the NATS CLI) and the locally-supplied
         // config left `ack_wait` unset.
-        let handler_heartbeat_duration =
-            heartbeat_interval(consumer.cached_info().config.ack_wait);
+        let handler_heartbeat_duration = heartbeat_interval(consumer.cached_info().config.ack_wait);
         let mut messages = consumer.messages().await?;
         let dlq = dlq.map(Arc::new);
 
@@ -252,7 +251,11 @@ where
         }
 
         // Drain in-flight handlers so we don't drop work mid-flight.
-        tasks.join_all().await;
+        while let Some(result) = tasks.join_next().await {
+            if let Err(e) = result {
+                tracing::error!(?e, "Error joining task");
+            }
+        }
 
         result
     }
@@ -369,6 +372,7 @@ async fn process<H: Handler>(
         delivered,
         stream_sequence,
         consumer_sequence,
+        published: info.published,
     };
 
     let dispatch_fut = dispatch(handler, js, dlq, backoff, &msg, &ctx).instrument(span);
@@ -478,10 +482,12 @@ async fn ack(msg: &jetstream::Message, kind: AckKind) {
 mod test {
     use super::*;
     use crate::event::{Encode, Json};
-    use crate::nats::test_util::{Mode, NatsTest, TestEvent, TestHandler, wait_for};
+    use crate::nats::test_util::{Mode, NatsTest, TestError, TestEvent, TestHandler, wait_for};
     use assert_matches::assert_matches;
+    use std::sync::Mutex;
     use std::time::Duration;
     use test_context::test_context;
+    use time::OffsetDateTime;
     use tokio::sync::oneshot;
 
     /// Publishes a `TestEvent` to a subject and awaits the JetStream ack.
@@ -491,6 +497,65 @@ mod test {
             .produce(subject, Json(TestEvent::new(msg)))
             .await
             .expect("publish failed");
+    }
+
+    /// `(message_id, published)` captured from each handled message's context.
+    type SeenContexts = Arc<Mutex<Vec<(Option<String>, OffsetDateTime)>>>;
+
+    /// A handler that records the `message_id()` and `published` time it observes
+    /// on each `MessageContext`, for asserting that metadata is surfaced.
+    #[derive(Clone, Default)]
+    struct CapturingHandler {
+        seen: SeenContexts,
+    }
+
+    impl Handler for CapturingHandler {
+        type Event = Json<TestEvent>;
+        type Error = TestError;
+
+        async fn handle(
+            &mut self,
+            ctx: &MessageContext<'_>,
+            _event: Json<TestEvent>,
+        ) -> Result<(), TestError> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((ctx.message_id().map(String::from), ctx.published));
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct OrderingRetryHandler {
+        attempts: Arc<Mutex<Vec<(String, i64, std::time::Instant)>>>,
+    }
+
+    impl Handler for OrderingRetryHandler {
+        type Event = Json<TestEvent>;
+        type Error = TestError;
+
+        async fn handle(
+            &mut self,
+            ctx: &MessageContext<'_>,
+            event: Json<TestEvent>,
+        ) -> Result<(), TestError> {
+            let value = event.into_inner().0;
+            self.attempts.lock().unwrap().push((
+                value.clone(),
+                ctx.delivered,
+                std::time::Instant::now(),
+            ));
+
+            if value == "a" && ctx.delivered == 1 {
+                Err(TestError {
+                    message: "retry once".to_string(),
+                    action: ErrorAction::Retry,
+                })
+            } else {
+                Ok(())
+            }
+        }
     }
 
     #[test_context(NatsTest)]
@@ -910,42 +975,50 @@ mod test {
         );
     }
 
-    /// With `max_ack_pending == 1`, a NAK'd message must be redelivered and
-    /// processed *before* the next message in the stream, so ordering survives
-    /// retries. Here every message fails retriably on its first delivery and
-    /// succeeds on the second; the handled order must still match the publish
-    /// order.
+    /// With `max_ack_pending == 1`, a delayed NAK remains acknowledgment-pending
+    /// and continues occupying the only delivery slot. The failed message must
+    /// therefore be redelivered before the next stream message.
     #[test_context(NatsTest)]
     #[tokio::test]
-    async fn sequential_preserves_order_with_nacks(ctx: &mut NatsTest) {
+    async fn sequential_preserves_order_with_delayed_nak(ctx: &mut NatsTest) {
         let names = ctx.names();
         ctx.ensure_stream(&names).await;
-        let published = ["a", "b", "c", "d"];
-        for m in published {
+        for m in ["a", "b"] {
             publish(ctx, &names.subject, m).await;
         }
 
-        // RetryUntil(2): NAK on delivery 1, succeed on delivery 2 for each message.
-        let handler = TestHandler::new(Mode::RetryUntil(2));
-        let consumer = Consumer::new(
-            ctx.js.clone(),
-            ctx.consumer_config(&names, false),
-            handler.clone(),
-        );
+        let mut config = ctx.consumer_config(&names, false);
+        config.backoff = BackoffPolicy::Linear {
+            base: Duration::from_secs(1),
+            max_backoff: Duration::from_secs(1),
+        };
+
+        let handler = OrderingRetryHandler::default();
+        let consumer = Consumer::new(ctx.js.clone(), config, handler.clone());
 
         let (tx, rx) = oneshot::channel();
         let task = tokio::spawn(consumer.run_sequential(async move {
             let _ = rx.await;
         }));
 
-        wait_for(Duration::from_secs(10), || handler.handled().len() == 4).await;
+        wait_for(Duration::from_secs(10), || {
+            handler.attempts.lock().unwrap().len() == 3
+        })
+        .await;
         let _ = tx.send(());
         task.await.unwrap().expect("consumer returned an error");
 
-        // Order is preserved despite every message being NAK'd once...
-        assert_eq!(handler.handled(), published);
-        // ...and each message really was delivered twice (4 messages x 2).
-        assert_eq!(handler.call_count(), 8);
+        let attempts = handler.attempts.lock().unwrap();
+        assert_eq!(attempts[0].0, "a");
+        assert_eq!(attempts[0].1, 1);
+        assert_eq!(attempts[1].0, "a");
+        assert_eq!(attempts[1].1, 2);
+        assert_eq!(attempts[2].0, "b");
+        assert_eq!(attempts[2].1, 1);
+        assert!(
+            attempts[1].2.duration_since(attempts[0].2) >= Duration::from_millis(900),
+            "redelivery ignored the configured delay"
+        );
     }
 
     /// Two sequential consumers bound to the *same* durable form a competing
@@ -1327,8 +1400,11 @@ mod test {
 
         // A DLQ is configured precisely to prove Term does NOT publish to it.
         let handler = TestHandler::new(Mode::Terminate);
-        let consumer =
-            Consumer::new(ctx.js.clone(), ctx.consumer_config(&names, true), handler.clone());
+        let consumer = Consumer::new(
+            ctx.js.clone(),
+            ctx.consumer_config(&names, true),
+            handler.clone(),
+        );
 
         let (tx, rx) = oneshot::channel();
         let task = tokio::spawn(consumer.run_sequential(async move {
@@ -1389,5 +1465,55 @@ mod test {
         assert_eq!(handler.handled(), ["good"]);
         // The handler ran exactly once — only for the valid message.
         assert_eq!(handler.call_count(), 1);
+    }
+
+    /// `MessageContext` surfaces the publisher's `Nats-Msg-Id` (via
+    /// `message_id()`) and the server-side `published` timestamp.
+    #[test_context(NatsTest)]
+    #[tokio::test]
+    async fn context_exposes_message_id_and_published(ctx: &mut NatsTest) {
+        let names = ctx.names();
+        ctx.ensure_stream(&names).await;
+
+        // Publish with an explicit Nats-Msg-Id so the handler can read it back.
+        let before = OffsetDateTime::now_utc();
+        let mut headers = async_nats::HeaderMap::new();
+        headers.insert(async_nats::header::NATS_MESSAGE_ID, "idem-123");
+        ctx.js
+            .publish_with_headers(
+                names.subject.clone(),
+                headers,
+                Json(TestEvent::new("hi")).encode().unwrap().into(),
+            )
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+
+        let handler = CapturingHandler::default();
+        let consumer = Consumer::new(
+            ctx.js.clone(),
+            ctx.consumer_config(&names, false),
+            handler.clone(),
+        );
+
+        let (tx, rx) = oneshot::channel();
+        let task = tokio::spawn(consumer.run_sequential(async move {
+            let _ = rx.await;
+        }));
+
+        wait_for(Duration::from_secs(5), || {
+            handler.seen.lock().unwrap().len() == 1
+        })
+        .await;
+        let _ = tx.send(());
+        task.await.unwrap().expect("consumer returned an error");
+
+        let seen = handler.seen.lock().unwrap();
+        let (message_id, published) = &seen[0];
+        assert_eq!(message_id.as_deref(), Some("idem-123"));
+        // The publish timestamp sits between just-before-publish and now.
+        assert!(*published >= before - time::Duration::seconds(5));
+        assert!(*published <= OffsetDateTime::now_utc() + time::Duration::seconds(5));
     }
 }

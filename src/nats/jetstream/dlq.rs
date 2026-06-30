@@ -57,6 +57,10 @@ pub struct DlqContext<'a> {
     pub retriable: bool,
 }
 
+fn sanitize_header_value(value: String) -> String {
+    value.replace(['\r', '\n'], " ")
+}
+
 /// Publishes a message to the DLQ subject and **awaits the JetStream ack**
 /// before returning.
 ///
@@ -72,7 +76,7 @@ pub(crate) async fn publish_to_dlq(
     let mut headers = HeaderMap::new();
 
     headers.insert(DLQ_SOURCE_SUBJECT, ctx.message.subject);
-    headers.insert(DLQ_ERROR, ctx.error);
+    headers.insert(DLQ_ERROR, sanitize_header_value(ctx.error));
     headers.insert(DLQ_RETRIABLE, ctx.retriable.to_string());
     headers.insert(DLQ_DELIVERED, ctx.message.delivered.to_string());
     headers.insert(DLQ_STREAM_SEQUENCE, ctx.message.stream_sequence.to_string());
@@ -114,6 +118,14 @@ mod test {
     use std::time::Duration;
     use test_context::test_context;
 
+    #[test]
+    fn error_header_removes_line_breaks() {
+        assert_eq!(
+            sanitize_header_value("first\r\nsecond\nthird".to_string()),
+            "first  second third"
+        );
+    }
+
     /// Builds a `MessageContext` with the given identity for driving DLQ publishes.
     fn message_ctx<'a>(
         subject: &'a str,
@@ -128,6 +140,7 @@ mod test {
             delivered,
             stream_sequence,
             consumer_sequence: stream_sequence,
+            published: time::OffsetDateTime::UNIX_EPOCH,
         }
     }
 

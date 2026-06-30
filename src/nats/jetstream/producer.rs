@@ -2,7 +2,8 @@
 //! [`async_nats::jetstream::Context`].
 
 use crate::event::Encode;
-use crate::nats::error::{Error, NatsResult};
+use crate::nats::error::NatsResult;
+use crate::nats::extensions::prepare_publish;
 use async_nats::HeaderMap;
 use async_nats::jetstream::Context;
 use async_nats::jetstream::publish::PublishAck;
@@ -40,14 +41,10 @@ impl Producer for Context {
     async fn produce_with_headers<T: Encode>(
         &self,
         subject: &str,
-        #[cfg_attr(not(feature = "telemetry"), allow(unused_mut))] mut headers: HeaderMap,
+        headers: HeaderMap,
         message: T,
     ) -> NatsResult<PublishAck> {
-        let subject = subject.to_owned();
-        let payload = message.encode().map_err(Error::event)?;
-
-        #[cfg(feature = "telemetry")]
-        crate::nats::telemetry::inject_producer_context(&subject, &mut headers);
+        let (subject, headers, payload) = prepare_publish(subject, headers, message)?;
 
         // Double await: the first resolves once the publish is sent, the second
         // resolves once the server confirms the message was persisted.
@@ -64,6 +61,7 @@ impl Producer for Context {
 mod test {
     use super::*;
     use crate::event::{Decode, Json};
+    use crate::nats::error::Error;
     use crate::nats::test_util::{NatsTest, TestEvent};
     use assert_matches::assert_matches;
     use async_nats::jetstream::stream::Config as StreamConfig;

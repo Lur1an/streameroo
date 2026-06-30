@@ -10,6 +10,7 @@ use async_nats::HeaderMap;
 use std::fmt::Display;
 use std::future::Future;
 use std::time::Duration;
+use time::OffsetDateTime;
 
 /// Errors returned by a [`Handler`] must declare how the message should be
 /// acknowledged via [`HandlerError::action`].
@@ -102,6 +103,23 @@ pub struct MessageContext<'a> {
     pub stream_sequence: u64,
     /// The message's sequence number within the consumer.
     pub consumer_sequence: u64,
+    /// The time the message was received by the server from its original
+    /// publisher, with its UTC offset preserved. Useful for computing message
+    /// age / processing lag.
+    pub published: OffsetDateTime,
+}
+
+impl MessageContext<'_> {
+    /// The `Nats-Msg-Id` header value, if the publisher set one.
+    ///
+    /// This is the id JetStream uses for its publish deduplication window and is
+    /// a convenient idempotency key for handlers. Returns `None` when the header
+    /// is absent.
+    pub fn message_id(&self) -> Option<&str> {
+        self.headers
+            .and_then(|headers| headers.get(async_nats::header::NATS_MESSAGE_ID))
+            .map(|value| value.as_str())
+    }
 }
 
 /// Processes messages from a JetStream consumer.
