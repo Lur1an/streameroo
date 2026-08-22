@@ -1,5 +1,5 @@
 ---
-source: src/nats/telemetry.rs
+source: tests/nats/telemetry.rs
 expression: mine
 ---
 - trace_id: "[trace_id]"
@@ -41,11 +41,11 @@ expression: mine
   end_time_unix_nano: "[ts]"
   attributes:
     busy_ns: "[ns]"
-    code.file.path: "Some(AnyValue { value: Some(StringValue(\"src/nats/telemetry.rs\")) })"
+    code.file.path: "Some(AnyValue { value: Some(StringValue(\"tests/nats/telemetry.rs\")) })"
     code.line.number: "[code.line.number]"
-    code.module.name: "Some(AnyValue { value: Some(StringValue(\"streameroo::nats::telemetry::test::integration\")) })"
+    code.module.name: "Some(AnyValue { value: Some(StringValue(\"nats_telemetry::telemetry\")) })"
     idle_ns: "[ns]"
-    target: "Some(AnyValue { value: Some(StringValue(\"streameroo::nats::telemetry::test::integration\")) })"
+    target: "Some(AnyValue { value: Some(StringValue(\"nats_telemetry::telemetry\")) })"
     thread.id: "[thread.id]"
     thread.name: "[thread.name]"
   dropped_attributes_count: 0
@@ -66,11 +66,11 @@ expression: mine
   end_time_unix_nano: "[ts]"
   attributes:
     busy_ns: "[ns]"
-    code.file.path: "Some(AnyValue { value: Some(StringValue(\"src/nats/telemetry.rs\")) })"
+    code.file.path: "Some(AnyValue { value: Some(StringValue(\"tests/nats/telemetry.rs\")) })"
     code.line.number: "[code.line.number]"
-    code.module.name: "Some(AnyValue { value: Some(StringValue(\"streameroo::nats::telemetry::test::integration\")) })"
+    code.module.name: "Some(AnyValue { value: Some(StringValue(\"nats_telemetry::telemetry\")) })"
     idle_ns: "[ns]"
-    target: "Some(AnyValue { value: Some(StringValue(\"streameroo::nats::telemetry::test::integration\")) })"
+    target: "Some(AnyValue { value: Some(StringValue(\"nats_telemetry::telemetry\")) })"
     thread.id: "[thread.id]"
     thread.name: "[thread.name]"
   dropped_attributes_count: 0

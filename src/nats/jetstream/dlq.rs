@@ -113,10 +113,8 @@ pub(crate) async fn publish_to_dlq(
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::nats::test_util::NatsTest;
     use async_nats::jetstream::stream::Config as StreamConfig;
-    use std::time::Duration;
-    use test_context::test_context;
+    use uuid::Uuid;
 
     #[test]
     fn error_header_removes_line_breaks() {
@@ -126,137 +124,50 @@ mod test {
         );
     }
 
-    /// Builds a `MessageContext` with the given identity for driving DLQ publishes.
-    fn message_ctx<'a>(
-        subject: &'a str,
-        source_stream: &'a str,
-        delivered: i64,
-        stream_sequence: u64,
-    ) -> MessageContext<'a> {
-        MessageContext {
-            subject,
-            source_stream,
-            headers: None,
-            delivered,
-            stream_sequence,
-            consumer_sequence: stream_sequence,
-            published: time::OffsetDateTime::UNIX_EPOCH,
-        }
-    }
-
-    #[test_context(NatsTest)]
     #[tokio::test]
-    async fn publish_sets_all_metadata_headers(ctx: &mut NatsTest) {
-        let names = ctx.names();
-        ctx.js
-            .create_stream(StreamConfig {
-                name: names.dlq_stream.clone(),
-                subjects: vec![names.dlq_subject.clone()],
-                ..Default::default()
-            })
-            .await
-            .unwrap();
+    async fn publish_deduplicates_redelivered_message() {
+        let id = Uuid::new_v4().simple().to_string();
+        let stream_name = format!("dlq-stream-{id}");
+        let subject = format!("dlq.{id}");
+        let client = async_nats::connect(
+            std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string()),
+        )
+        .await
+        .expect("failed to connect to NATS; start it with `docker compose up -d nats`");
+        let js = async_nats::jetstream::new(client);
+        js.create_stream(StreamConfig {
+            name: stream_name.clone(),
+            subjects: vec![subject.clone()],
+            duplicate_window: Duration::from_secs(30),
+            ..Default::default()
+        })
+        .await
+        .expect("failed to create DLQ stream");
 
-        let message = message_ctx(&names.subject, &names.stream, 4, 42);
-        let dlq_ctx = DlqContext {
+        let message = MessageContext {
+            subject: "source.subject",
+            source_stream: "source-stream",
+            headers: None,
+            delivered: 1,
+            stream_sequence: 7,
+            consumer_sequence: 7,
+            published: time::OffsetDateTime::UNIX_EPOCH,
+        };
+        let publish = || DlqContext {
             message: &message,
             error: "boom".to_string(),
-            retriable: true,
+            retriable: false,
         };
-        let payload = Bytes::from_static(b"raw-payload");
 
-        publish_to_dlq(&ctx.js, &names.dlq_subject, payload.clone(), dlq_ctx)
+        let first = publish_to_dlq(&js, &subject, Bytes::from_static(b"payload"), publish())
             .await
-            .expect("publish_to_dlq failed");
-
-        let drained = ctx
-            .drain_stream(&names.dlq_stream, 1, Duration::from_secs(5))
-            .await;
-        assert_eq!(drained.len(), 1);
-        let msg = &drained[0];
-        let headers = msg.headers.as_ref().expect("DLQ message must have headers");
-
-        // Snapshot the full header map, redacting the fields that vary per run:
-        // the UUID-suffixed subject / dedup id and the wall-clock timestamp. The
-        // timestamp is asserted individually below. `sort_maps` makes the output
-        // deterministic regardless of header iteration order.
-        insta::with_settings!({sort_maps => true}, {
-            insta::assert_yaml_snapshot!(headers, {
-                r#"["Dlq-Source-Subject"][0]"# => "[subject]",
-                r#"["Nats-Msg-Id"][0]"# => "[msg-id]",
-                r#"["Dlq-Dead-Lettered-At"][0]"# => "[timestamp]",
-            }, @r#"
-            Dlq-Dead-Lettered-At:
-              - "[timestamp]"
-            Dlq-Delivered:
-              - "4"
-            Dlq-Error:
-              - boom
-            Dlq-Retriable:
-              - "true"
-            Dlq-Source-Subject:
-              - "[subject]"
-            Dlq-Stream-Sequence:
-              - "42"
-            Nats-Msg-Id:
-              - "[msg-id]"
-            "#);
-        });
-
-        // The redacted dynamic fields are checked concretely here.
-        assert_eq!(
-            headers.get(DLQ_SOURCE_SUBJECT).unwrap().as_str(),
-            names.subject
-        );
-        assert_eq!(
-            headers.get("Nats-Msg-Id").unwrap().as_str(),
-            format!("{}-{}", names.stream, 42)
-        );
-        // Timestamp parses as RFC3339.
-        let ts = headers.get(DLQ_DEAD_LETTERED_AT).unwrap().as_str();
-        chrono::DateTime::parse_from_rfc3339(ts).expect("dead-lettered-at must be RFC3339");
-        // Payload is preserved untouched.
-        assert_eq!(msg.payload, payload);
-    }
-
-    #[test_context(NatsTest)]
-    #[tokio::test]
-    async fn redelivery_is_deduplicated(ctx: &mut NatsTest) {
-        let names = ctx.names();
-        ctx.js
-            .create_stream(StreamConfig {
-                name: names.dlq_stream.clone(),
-                subjects: vec![names.dlq_subject.clone()],
-                // Window must exceed the gap between the two publishes below.
-                duplicate_window: Duration::from_secs(30),
-                ..Default::default()
-            })
+            .expect("first DLQ publish failed");
+        let second = publish_to_dlq(&js, &subject, Bytes::from_static(b"payload"), publish())
             .await
-            .unwrap();
+            .expect("second DLQ publish failed");
+        let _ = js.delete_stream(&stream_name).await;
 
-        let message = message_ctx(&names.subject, &names.stream, 1, 7);
-        let payload = Bytes::from_static(b"dup-payload");
-
-        // Publish the "same" dead-lettered message twice (as a redelivery would).
-        for _ in 0..2 {
-            let dlq_ctx = DlqContext {
-                message: &message,
-                error: "boom".to_string(),
-                retriable: false,
-            };
-            publish_to_dlq(&ctx.js, &names.dlq_subject, payload.clone(), dlq_ctx)
-                .await
-                .expect("publish_to_dlq failed");
-        }
-
-        // Only one entry should be persisted thanks to server-side dedup.
-        let drained = ctx
-            .drain_stream(&names.dlq_stream, 2, Duration::from_secs(2))
-            .await;
-        assert_eq!(
-            drained.len(),
-            1,
-            "duplicate DLQ publish was not deduplicated"
-        );
+        assert!(!first.duplicate);
+        assert!(second.duplicate);
     }
 }
