@@ -7,13 +7,14 @@ use amqprs::channel::{
     BasicAckArguments, BasicConsumeArguments, BasicNackArguments, BasicQosArguments,
     ConsumerMessage,
 };
+use std::fmt::Display;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
 use tracing::Instrument;
 
-pub struct Consumer<H: Handler> {
+pub struct Consumer<H> {
     connection: AMQPConnection,
     consume_args: BasicConsumeArguments,
     qos_args: BasicQosArguments,
@@ -21,7 +22,7 @@ pub struct Consumer<H: Handler> {
     notifier: Arc<Notify>,
 }
 
-impl<H: Handler> Consumer<H> {
+impl<H> Consumer<H> {
     pub fn new(
         connection: AMQPConnection,
         options: BasicConsumeArguments,
@@ -39,13 +40,18 @@ impl<H: Handler> Consumer<H> {
     }
 
     /// Handles a single delivery by spawning a task to process it
-    fn handle_delivery(
+    fn handle_delivery<E, R, Err>(
         &self,
         delivery: ConsumerMessage,
         channel: &amqprs::channel::Channel,
         skip_ack: bool,
         tasks: &mut JoinSet<()>,
-    ) {
+    ) where
+        H: Handler<E, R, Err>,
+        E: AMQPDecode + Send,
+        R: AMQPResult,
+        Err: Display + Send,
+    {
         let (ctx, payload) = create_delivery_context(delivery, channel);
         let handler = self.handler.clone();
 
@@ -59,7 +65,7 @@ impl<H: Handler> Consumer<H> {
 
         let fut = async move {
             // Decode error → nack WITHOUT requeue (would fail again on retry)
-            let event = match H::Event::decode(payload, &ctx) {
+            let event = match E::decode(payload, &ctx) {
                 Ok(event) => event,
                 Err(e) => {
                     tracing::error!(%e, "Failed to decode event, nacking without requeue");
@@ -129,12 +135,18 @@ impl<H: Handler> Consumer<H> {
     /// Consumes the consumer and starts the loop.
     /// The loop will run indefinitely, relying on `AMQPConnection` to restore the connection
     /// if it is closed, until the notifier is triggered.
-    pub async fn consume(self) {
+    pub async fn consume<E, R, Err>(self)
+    where
+        H: Handler<E, R, Err>,
+        E: AMQPDecode + Send,
+        R: AMQPResult,
+        Err: Display + Send,
+    {
         let notified = self.notifier.notified();
         tokio::pin!(notified);
 
         let mut tasks = JoinSet::new();
-        let skip_ack = H::Result::manual() || self.consume_args.no_ack;
+        let skip_ack = R::manual() || self.consume_args.no_ack;
         let mut channel;
         'outer: loop {
             tracing::info!("Creating channel for consumer");
@@ -166,7 +178,7 @@ impl<H: Handler> Consumer<H> {
                     },
                     delivery = consumer_rx.recv() => {
                         if let Some(delivery) = delivery {
-                            self.handle_delivery(delivery, &channel, skip_ack, &mut tasks);
+                            self.handle_delivery::<E, R, Err>(delivery, &channel, skip_ack, &mut tasks);
                         } else {
                             tracing::warn!("Consumer closed unexpectedly");
                             break

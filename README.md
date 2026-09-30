@@ -1,16 +1,16 @@
 # streameroo
 
-A mini-framework for building resilient asynchronous AMQP/RabbitMQ consumer applications in Rust, inspired by [Axum](https://github.com/tokio-rs/axum)'s ergonomic handler pattern.
+A mini-framework for building resilient asynchronous AMQP/RabbitMQ consumer applications in Rust.
 
 Built on top of [`amqprs`](https://github.com/gftea/amqprs) and [`tokio`](https://tokio.rs).
 
 ## Features
 
-- **Axum-style handlers** -- plain async functions become message handlers via compile-time extraction
+- **Typed handlers** -- implement `Handler<E, R, Err>` on your own structs, including multiple event types per struct
 - **Automatic connection recovery** -- background IO loop with reconnection and a pre-allocated channel pool for publishing
 - **Consumer resilience** -- consumers automatically recover from channel/connection failures
 - **Flexible serialization** -- JSON, MessagePack, BSON, raw bytes, or runtime content-type dispatch via `Auto<T>`
-- **Dependency injection** -- global state and per-delivery metadata extractors
+- **Explicit state and metadata** -- store dependencies in your handler and access message metadata through `DeliveryContext`
 - **Result-driven actions** -- handler return types control ack/nack, publish, or RPC reply behavior
 - **Distributed tracing** -- optional OpenTelemetry trace propagation through AMQP headers
 - **Graceful shutdown** -- signal-based shutdown that drains in-flight deliveries
@@ -23,17 +23,24 @@ Add `streameroo` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-streameroo = "0.4.2"
+streameroo = "0.7"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+serde = { version = "1", features = ["derive"] }
+anyhow = "1"
 ```
 
-The default features enable `tokio` and `json` (serde_json). See [Feature Flags](#feature-flags) for additional options.
+The default features are `amqp` and `json` (serde_json). See [Feature Flags](#feature-flags) for additional options.
 
 ### Define an event
 
 Any `DeserializeOwned` struct works with the built-in `Json<T>` wrapper:
 
 ```rust
-#[derive(Debug, Deserialize)]
+use serde::{Deserialize, Serialize};
+use streameroo::amqp::*;
+use streameroo::event::Json;
+
+#[derive(Debug, Serialize, Deserialize)]
 struct MyEvent {
     hello: String,
 }
@@ -41,29 +48,31 @@ struct MyEvent {
 
 ### Write a handler
 
-A handler is any async function whose parameters are extractors followed by a final event parameter:
+A handler is a cloneable struct implementing `Handler<E, R, Err>`. Store shared dependencies in its fields, using `Arc` or cloneable handles as appropriate:
 
 ```rust
-async fn my_handler(
-    pool: State<PgPool>,
-    redelivered: Redelivered,
-    event: Json<MyEvent>,
-) -> anyhow::Result<()> {
-    tracing::info!(?event, "received");
-    Ok(())
+#[derive(Clone)]
+struct MyHandler;
+
+impl Handler<Json<MyEvent>, (), anyhow::Error> for MyHandler {
+    async fn handle(
+        &self,
+        ctx: &DeliveryContext,
+        event: Json<MyEvent>,
+    ) -> anyhow::Result<()> {
+        println!("received {:?}, redelivered={}", event, ctx.redelivered);
+        Ok(())
+    }
 }
 ```
 
-- `pool` -- shared state injected from the application `Context`
-- `redelivered` -- extractor for the AMQP `redelivered` flag
-- `event` -- the deserialized message body (last parameter, must implement `AMQPDecode`)
+- `ctx` -- delivery metadata and the receiving AMQP channel
+- `event` -- the decoded message body, which must implement `AMQPDecode`
 - Returning `Ok(())` acknowledges the delivery; returning `Err` nacks with requeue
 
 ### Run the application
 
 ```rust
-use streameroo::amqp::*;
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = amqprs::connection::OpenConnectionArguments::new(
@@ -71,68 +80,76 @@ async fn main() -> anyhow::Result<()> {
     );
     let connection = AMQPConnection::connect(args).await?;
 
-    let mut context = Context::new();
-    context.data(pgpool); // register any shared state
+    let channel = connection.open_channel().await?;
+    channel
+        .queue_declare(amqprs::channel::QueueDeclareArguments::new("my-queue"))
+        .await?;
 
-    let mut app = Streameroo::new(connection, context, "my-consumer");
+    let mut app = Streameroo::new(connection, "my-consumer");
     app.with_graceful_shutdown(tokio::signal::ctrl_c());
-    app.consume(my_handler, "my-queue", 10).await?;
+    app.consume(MyHandler, "my-queue", 10).await?;
     app.join().await;
 
     Ok(())
 }
 ```
 
-The third argument to `consume` sets both the number of concurrent handler tasks and the prefetch count. For full control over QoS and consume options, use `consume_with_options`.
+Combine the three Rust snippets above into `src/main.rs` and run against RabbitMQ on localhost. The third argument to `consume` sets the AMQP prefetch count. Each delivery gets its own task; there is no separate worker pool or task limit. A prefetch count of zero means unlimited. For full control over QoS and consume options, use `consume_with_options`.
 
 ## Handlers
 
-### `AMQPHandler`
+### `Handler<E, R, Err>`
 
-The `AMQPHandler` trait is automatically implemented for async functions with up to 13 extractor parameters plus one event parameter. You never implement it manually.
+Implement `handle(&self, ctx: &DeliveryContext, event: E)` to return a `Send` future yielding `Result<R, Err>`.
+
+**Constraints:**
+- The handler must be `Clone + Send + 'static`; it is cloned for each delivery.
+- `E: AMQPDecode + Send` is the event type.
+- `R: AMQPResult` controls the successful delivery's result action.
+- `Err: Display + Send` is the handler error type (for example, `anyhow::Error` or `Infallible`).
+- Registering a consumer additionally requires `E`, `R`, and `Err` to be `'static`.
+
+Types implementing the transport-independent `Decode` trait automatically implement `AMQPDecode`. Implement `AMQPDecode` directly when decoding needs delivery metadata.
+
+### Multiple event types
+
+One struct can implement `Handler` for multiple event types. For example, add a second implementation to the quickstart handler:
 
 ```rust
-async fn handler(
-    // 0..13 extractors (impl FromDeliveryContext)
-    state: StateOwned<Arc<AtomicU8>>,
-    exchange: Exchange,
-    redelivered: Redelivered,
-    // last parameter: the event (impl AMQPDecode)
-    event: Json<MyEvent>,
-) -> anyhow::Result<()> {
-    // ...
-    Ok(())
+impl Handler<Vec<u8>, (), anyhow::Error> for MyHandler {
+    async fn handle(&self, _: &DeliveryContext, event: Vec<u8>) -> anyhow::Result<()> {
+        println!("received {} bytes", event.len());
+        Ok(())
+    }
 }
 ```
 
-**Constraints:**
-- The **last** parameter must implement `AMQPDecode` (the message payload)
-- All preceding parameters must implement `FromDeliveryContext`
-- The error type must implement `Into<Box<dyn Error + Send + Sync>>` (e.g. `anyhow::Error`)
-- The return type `T` must implement `AMQPResult`
-- The function must be `Clone + Send + Sync + 'static`
+Select the implementation when registering each queue:
 
-### Extractors
+```rust
+let handler = MyHandler;
+app.consume::<Json<MyEvent>, _, _, _>(handler.clone(), "my-queue", 10).await?;
+app.consume::<Vec<u8>, _, _, _>(handler, "raw-queue", 10).await?;
+```
 
-Extractors pull data from the delivery context and are used as handler parameters (before the event).
+The generic parameter order is `<E, R, Err, H>` for both `consume` and `consume_with_options`. With only one applicable implementation, these types are inferred.
 
-| Extractor | Inner Type | Description |
-|-----------|-----------|-------------|
-| `State<T>` | `&'static T` | Static reference to shared state from `Context` |
-| `StateOwned<T>` | `T` | Cloned copy of shared state (requires `T: Clone`) |
-| `Exchange` | `String` | The exchange the message was published to |
-| `RoutingKey` | `String` | The routing key of the delivery |
-| `ReplyTo` | `Option<String>` | The `reply-to` property, if present |
-| `DeliveryTag` | `u64` | The AMQP delivery tag |
-| `Redelivered` | `bool` | Whether this is a redelivery |
-| `BasicProperties` | `BasicProperties` | The full AMQP properties (cloned) |
-| `Channel` | `Channel` | The AMQP channel that received the delivery |
+### `DeliveryContext`
 
-All wrapper extractors implement `Deref` to their inner type and provide `into_inner()`.
+Access metadata directly through the context passed to `handle`:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `exchange` | `String` | The exchange the message was published to |
+| `routing_key` | `String` | The routing key of the delivery |
+| `delivery_tag` | `AmqpDeliveryTag` | The AMQP delivery tag |
+| `redelivered` | `bool` | Whether this is a redelivery |
+| `properties` | `BasicProperties` | Message properties; use `ctx.properties.reply_to()` for the reply address |
+| `channel` | `Channel` | The AMQP channel that received the delivery |
 
 ### `AMQPResult`
 
-The handler's return type controls what happens after successful execution. The trait provides a `manual()` flag: when `false` (the default), the framework auto-acks on success.
+The success type `R` controls what happens after successful execution. The trait provides a `manual()` flag: when `false` (the default), the framework auto-acks on success unless the consumer has `no_ack` enabled.
 
 | Return Type | Behavior |
 |-------------|----------|
@@ -146,42 +163,64 @@ The handler's return type controls what happens after successful execution. The 
 Publishes a message to another queue after handling:
 
 ```rust
-async fn forward_handler(
-    event: Json<MyEvent>,
-) -> anyhow::Result<Publish<Json<MyEvent>>> {
-    Ok(Publish::new(event, "", "forwarded-queue"))
+#[derive(Clone)]
+struct ForwardHandler;
+
+impl Handler<Json<MyEvent>, Publish<Json<MyEvent>>, anyhow::Error> for ForwardHandler {
+    async fn handle(
+        &self,
+        _: &DeliveryContext,
+        event: Json<MyEvent>,
+    ) -> anyhow::Result<Publish<Json<MyEvent>>> {
+        Ok(Publish::new(event, "", "forwarded-queue"))
+    }
 }
 ```
 
-The `Publish` struct also exposes `options` and `properties` fields for full control over the publish arguments.
+The payload must implement `Encode + Send`. Set `Publish::properties` to customize message properties. For custom publish arguments, call `ctx.channel.publish_with_options(...)` directly.
 
 #### `PublishReply<E>`
 
 Implements the RPC reply-to pattern:
 
 ```rust
-async fn rpc_handler(
-    event: Json<Request>,
-) -> anyhow::Result<PublishReply<Json<Response>>> {
-    let response = process(event.into_inner());
-    Ok(PublishReply::new(Json(response)))
+#[derive(Clone)]
+struct RpcHandler;
+
+impl Handler<Json<String>, PublishReply<Json<String>>, anyhow::Error> for RpcHandler {
+    async fn handle(
+        &self,
+        _: &DeliveryContext,
+        event: Json<String>,
+    ) -> anyhow::Result<PublishReply<Json<String>>> {
+        Ok(PublishReply::new(Json(format!("Hello, {}", event.into_inner()))))
+    }
 }
 ```
 
-If no `reply-to` header is present on the incoming message, the reply is silently discarded.
+If no `reply-to` property is present on the incoming message, the reply is silently discarded.
 
 #### `DeliveryAction`
 
 For fine-grained ack/nack control:
 
 ```rust
-async fn manual_handler(
-    event: Json<MyEvent>,
-) -> Result<DeliveryAction, Infallible> {
-    if should_requeue(&event) {
-        Ok(DeliveryAction::Nack { requeue: true, multiple: false })
-    } else {
-        Ok(DeliveryAction::Ack { multiple: false })
+use std::convert::Infallible;
+
+#[derive(Clone)]
+struct ManualHandler;
+
+impl Handler<Json<MyEvent>, DeliveryAction, Infallible> for ManualHandler {
+    async fn handle(
+        &self,
+        _: &DeliveryContext,
+        event: Json<MyEvent>,
+    ) -> Result<DeliveryAction, Infallible> {
+        if event.hello.is_empty() {
+            Ok(DeliveryAction::Nack { requeue: false, multiple: false })
+        } else {
+            Ok(DeliveryAction::Ack { multiple: false })
+        }
     }
 }
 ```
@@ -193,7 +232,7 @@ The framework distinguishes error types to decide requeue behavior:
 | Error Source | Behavior |
 |-------------|----------|
 | Decode failure (`Error::Event`) | Nack **without** requeue (would fail again) |
-| Handler error (`Error::Handler`) | Nack **with** requeue (assumed transient) |
+| Handler error (`Err` from `handle`) | Nack **with** requeue (assumed transient) |
 | Result action failure | Nack **with** requeue |
 
 ## Serialization
@@ -235,9 +274,19 @@ All wrapper types implement `Deref`/`DerefMut` to the inner `T` and provide `int
 `Auto<T>` selects the deserializer at runtime based on the message's `content_type` AMQP property:
 
 ```rust
-async fn handler(event: Auto<MyEvent>) -> anyhow::Result<()> {
-    // Works with JSON, MsgPack, or BSON depending on the content-type header
-    Ok(())
+#[derive(Clone)]
+struct AutoHandler;
+
+impl Handler<Auto<MyEvent>, (), anyhow::Error> for AutoHandler {
+    async fn handle(
+        &self,
+        _: &DeliveryContext,
+        event: Auto<MyEvent>,
+    ) -> anyhow::Result<()> {
+        // Works with enabled formats, selected by the content-type property.
+        println!("received {}", event.hello);
+        Ok(())
+    }
 }
 ```
 
@@ -265,7 +314,7 @@ let connection = AMQPConnection::connect(args).await?;
 Key behaviors:
 - **Channel pool** -- pre-allocates 10 channels for publishing, used in round-robin
 - **Automatic reconnection** -- on connection failure, retries every 3 seconds indefinitely, re-opening all pool channels on success
-- **RPC timeout** -- all operations (open channel, publish) have a 10-second timeout
+- **IO loop request timeout** -- `open_channel` and `basic_publish` have a 10-second timeout
 
 Public API:
 - `connect(args)` -- create a new connection with IO loop
@@ -324,7 +373,7 @@ handle.notify_waiters();
 Enable distributed tracing with the `telemetry` feature:
 
 ```toml
-streameroo = { version = "0.4", features = ["telemetry"] }
+streameroo = { version = "0.7", features = ["telemetry"] }
 ```
 
 ### What it does
@@ -337,7 +386,7 @@ This creates unbroken traces across `producer -> broker -> consumer` boundaries,
 ### Span attributes
 
 Consumer and producer spans include:
-- `otel.name` -- `{exchange}.{routing_key}`
+- `otel.name` -- `{exchange}.{routing_key}`, or just the routing key for the default exchange
 - `otel.kind` -- `Consumer` or `Producer`
 - `amqp.exchange`, `amqp.routing_key`
 - `amqp.correlation_id`, `amqp.reply_to`, `amqp.content_type`
@@ -345,12 +394,11 @@ Consumer and producer spans include:
 
 ### Configuration
 
-The library does **not** initialize a tracing subscriber or OpenTelemetry pipeline. Your application is responsible for setting up the OTel exporter. The library uses `opentelemetry::global::get_text_map_propagator` for context propagation, so standard `OTEL_*` environment variables apply:
+Your application is responsible for initializing a tracing subscriber, OpenTelemetry exporter, and global text-map propagator (for example, W3C TraceContext). The library uses `opentelemetry::global::get_text_map_propagator` for context propagation. Depending on your exporter setup, configuration can include:
 
 ```bash
 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
 OTEL_EXPORTER_OTLP_PROTOCOL=grpc
-OTEL_PROPAGATORS=tracecontext,baggage
 ```
 
 A `compose.yaml` is included in the repository for running a local Jaeger instance:
@@ -410,7 +458,7 @@ let table = table_from_map(&map);
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `tokio` | yes | Tokio async runtime |
+| `amqp` | yes | AMQP consumers, connections, and publishing, backed by Tokio |
 | `json` | yes | `Json<T>` wrapper + `serde_json::Value` support |
 | `msgpack` | no | `MsgPack<T>` wrapper via MessagePack |
 | `bson` | no | `Bson<T>` wrapper via BSON |
@@ -426,7 +474,7 @@ Enable the `amqp-test` feature to access the test harness in your own integratio
 
 ```toml
 [dev-dependencies]
-streameroo = { version = "0.4", features = ["amqp-test"] }
+streameroo = { version = "0.7", features = ["amqp-test"] }
 test-context = "0.3"
 ```
 
@@ -442,11 +490,14 @@ async fn my_integration_test(ctx: &mut AMQPTest) {
 }
 ```
 
-`AMQPTest` automatically spins up a RabbitMQ container via testcontainers, creates a connection, and tears everything down after the test. The `consume_next` helper on `AMQPConnection` consumes and acks a single message from a queue:
+`AMQPTest` requires Docker and automatically spins up a RabbitMQ container via testcontainers, creates a connection, and tears everything down after the test. The `consume_next` helper on `AMQPConnection` consumes and acks a single message from a queue:
 
 ```rust
 let result: Json<MyEvent> = ctx.connection.consume_next("my-queue").await;
 ```
+
+Additional helpers include `start_rabbitmq_with_port(...)` and `connection.drain_queue(...)`.
+
 ## License
 
 Apache-2.0
