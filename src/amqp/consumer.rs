@@ -56,7 +56,7 @@ impl<H> Consumer<H> {
         let handler = self.handler.clone();
 
         #[cfg(feature = "telemetry")]
-        let span = super::telemetry::make_span_from_delivery_context(&ctx);
+        let span = super::telemetry::make_delivery_span(&ctx, Some(&self.consume_args.queue));
         #[cfg(not(feature = "telemetry"))]
         let span = {
             let delivery_tag = ctx.delivery_tag;
@@ -68,6 +68,8 @@ impl<H> Consumer<H> {
             let event = match E::decode(payload, &ctx) {
                 Ok(event) => event,
                 Err(e) => {
+                    #[cfg(feature = "telemetry")]
+                    super::telemetry::record_error(&tracing::Span::current(), "decode_error");
                     tracing::error!(%e, "Failed to decode event, nacking without requeue");
                     let nack_args = BasicNackArguments {
                         delivery_tag: ctx.delivery_tag,
@@ -85,6 +87,8 @@ impl<H> Consumer<H> {
             let result = match handler.handle(&ctx, event).await {
                 Ok(result) => result,
                 Err(e) => {
+                    #[cfg(feature = "telemetry")]
+                    super::telemetry::record_error(&tracing::Span::current(), "handler_error");
                     tracing::error!(%e, "Handler error, nacking with requeue");
                     let nack_args = BasicNackArguments {
                         delivery_tag: ctx.delivery_tag,
@@ -112,10 +116,17 @@ impl<H> Consumer<H> {
                         })
                         .await
                     {
+                        #[cfg(feature = "telemetry")]
+                        super::telemetry::record_error(
+                            &tracing::Span::current(),
+                            "settlement_error",
+                        );
                         tracing::error!(?e, "Error acking delivery");
                     }
                 }
                 Err(e) => {
+                    #[cfg(feature = "telemetry")]
+                    super::telemetry::record_error(&tracing::Span::current(), "result_error");
                     tracing::error!(?e, "Error processing AMQPResult, nacking delivery");
                     let nack_args = BasicNackArguments {
                         delivery_tag: ctx.delivery_tag,

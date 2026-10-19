@@ -119,28 +119,12 @@ impl ChannelExt for amqprs::channel::Channel {
         }
 
         #[cfg(feature = "telemetry")]
-        {
-            use super::telemetry::{inject_context, make_span_from_properties};
-            use opentelemetry::Context;
-            use opentelemetry::trace::SpanKind;
-            use tracing_opentelemetry::OpenTelemetrySpanExt;
-            use tracing_opentelemetry_instrumentation_sdk::find_context_from_tracing;
+        let span = super::telemetry::publish_span(&mut properties, &args);
 
-            let mut headers = properties.headers().cloned().unwrap_or_default();
-            let span = make_span_from_properties(
-                &properties,
-                SpanKind::Producer,
-                &args.exchange,
-                &args.routing_key,
-            );
-            if let Err(e) = span.set_parent(Context::current()) {
-                tracing::warn!("Failed to set parent context for span: {e}");
-            };
-            inject_context(&find_context_from_tracing(&span), &mut headers);
-            properties.with_headers(headers);
-        }
-
-        self.basic_publish(properties, payload, args).await?;
+        let publish = self.basic_publish(properties, payload, args);
+        #[cfg(feature = "telemetry")]
+        let publish = super::telemetry::trace_publish(publish, span);
+        publish.await?;
         Ok(())
     }
 }
@@ -188,23 +172,12 @@ impl ChannelExt for AMQPConnection {
         }
 
         #[cfg(feature = "telemetry")]
-        {
-            use super::telemetry::{inject_context, make_span_from_properties};
-            use opentelemetry::trace::SpanKind;
-            use tracing_opentelemetry_instrumentation_sdk::find_context_from_tracing;
+        let span = super::telemetry::publish_span(&mut properties, &args);
 
-            let mut headers = properties.headers().cloned().unwrap_or_default();
-            let span = make_span_from_properties(
-                &properties,
-                SpanKind::Producer,
-                &args.exchange,
-                &args.routing_key,
-            );
-            inject_context(&find_context_from_tracing(&span), &mut headers);
-            properties.with_headers(headers);
-        }
-
-        self.basic_publish(properties, payload, args).await?;
+        let publish = self.basic_publish(properties, payload, args);
+        #[cfg(feature = "telemetry")]
+        let publish = super::telemetry::trace_publish(publish, span);
+        publish.await?;
         Ok(())
     }
 }

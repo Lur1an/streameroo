@@ -181,6 +181,94 @@ impl AMQPConnection {
     }
 }
 
+#[cfg(all(test, feature = "telemetry"))]
+mod telemetry_tests {
+    use super::*;
+    use crate::amqp::{ChannelExt, telemetry};
+    use opentelemetry::trace::{SpanKind, Status, TraceContextExt, TracerProvider};
+    use opentelemetry_sdk::propagation::TraceContextPropagator;
+    use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+    use tracing_subscriber::prelude::*;
+
+    #[tokio::test]
+    async fn publish_span_covers_pending_publish_and_records_outcome() {
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test")));
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+
+        for fail in [false, true] {
+            exporter.reset();
+            let (tx, mut rx) = mpsc::channel(1);
+            let connection = AMQPConnection {
+                tx,
+                rpc_timeout: Duration::from_secs(10),
+            };
+            let parent = tracing::info_span!("caller");
+            let parent_context = parent.context();
+            let _entered = parent.enter();
+            let publish = connection.publish("orders", "created", vec![1, 2, 3]);
+            tokio::pin!(publish);
+            let request = tokio::select! {
+                result = &mut publish => panic!("publish completed before broker response: {result:?}"),
+                request = rx.recv() => request.unwrap(),
+            };
+            let AMQPRpc::Publish(request) = request else {
+                panic!("expected a publish request");
+            };
+            let context = telemetry::extract_context(request.properties.headers().unwrap());
+            let propagated = context.span().span_context().clone();
+            assert!(propagated.is_valid());
+            assert_eq!(
+                propagated.trace_id(),
+                parent_context.span().span_context().trace_id()
+            );
+            assert!(exporter.get_finished_spans().unwrap().is_empty());
+
+            let completed_at = std::time::SystemTime::now();
+            if fail {
+                drop(request.tx);
+            } else {
+                request.tx.send(Ok(())).unwrap();
+            }
+            assert_eq!(publish.await.is_err(), fail);
+
+            let spans = exporter.get_finished_spans().unwrap();
+            let producer = spans
+                .iter()
+                .find(|span| span.span_kind == SpanKind::Producer)
+                .unwrap();
+            assert_eq!(producer.name, "publish orders:created");
+            assert_eq!(producer.span_context.span_id(), propagated.span_id());
+            assert!(producer.end_time >= completed_at);
+            let publish_call = spans
+                .iter()
+                .find(|span| span.name == "streameroo::amqp::publish_with_options")
+                .unwrap();
+            assert_eq!(producer.parent_span_id, publish_call.span_context.span_id());
+            let error_type = producer
+                .attributes
+                .iter()
+                .find(|attr| attr.key.as_str() == "error.type");
+            if fail {
+                assert!(matches!(producer.status, Status::Error { .. }));
+                assert_eq!(
+                    error_type.unwrap().value.as_str(),
+                    std::any::type_name::<ConnectionError>()
+                );
+            } else {
+                assert_eq!(producer.status, Status::Unset);
+                assert!(error_type.is_none());
+            }
+        }
+    }
+}
+
 #[cfg(any(test, feature = "amqp-test"))]
 pub mod amqp_test {
     use super::*;

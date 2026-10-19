@@ -1149,6 +1149,7 @@ dependencies = [
  "js-sys",
  "pin-project-lite",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]
@@ -2002,6 +2003,7 @@ dependencies = [
  "init-tracing-opentelemetry",
  "nix",
  "opentelemetry",
+ "opentelemetry_sdk",
  "rmp-serde",
  "serde",
  "serde_json",

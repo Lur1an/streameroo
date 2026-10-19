@@ -20,6 +20,14 @@ Entries follow development/release order, including the historical `0.1.77`,
   and `Err` to be `'static`.
 - Includes the unpublished `0.6.0` handler and feature changes below. Applications
   upgrading from `0.5.0` must also migrate state and metadata access.
+- Replace custom AMQP telemetry attributes with RabbitMQ `messaging.*` attributes
+  and operation-prefixed span names. Consumer destinations include the queue name.
+
+### Fixes
+
+- Keep producer spans active until publishing completes in both `ChannelExt`
+  implementations, preserving the active tracing parent and recording failures.
+- Record standardized error attributes and status for consumer processing failures.
 
 ### Documentation
 

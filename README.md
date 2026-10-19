@@ -378,19 +378,34 @@ streameroo = { version = "0.7", features = ["telemetry"] }
 
 ### What it does
 
-- **Producer side**: when publishing via `ChannelExt`, a `SpanKind::Producer` span is created and trace context (W3C `traceparent`/`tracestate`) is injected into AMQP message headers
+- **Producer side**: when publishing via `ChannelExt`, a `SpanKind::Producer` span covers the publish await and trace context (W3C `traceparent`/`tracestate`) is injected into AMQP message headers
 - **Consumer side**: when a delivery arrives, trace context is extracted from AMQP headers and set as the parent of a `SpanKind::Consumer` span that wraps the handler execution
 
 This creates unbroken traces across `producer -> broker -> consumer` boundaries, visible in any OpenTelemetry-compatible backend (Jaeger, Grafana Tempo, Honeycomb, Datadog, etc.).
 
 ### Span attributes
 
-Consumer and producer spans include:
-- `otel.name` -- `{exchange}.{routing_key}`, or just the routing key for the default exchange
-- `otel.kind` -- `Consumer` or `Producer`
-- `amqp.exchange`, `amqp.routing_key`
-- `amqp.correlation_id`, `amqp.reply_to`, `amqp.content_type`
-- `delivery_tag` (consumer only)
+Consumer and producer span names and attributes follow the development
+[RabbitMQ semantic conventions](https://opentelemetry.io/docs/specs/semconv/messaging/rabbitmq/)
+as reviewed on 2026-10-11:
+
+- Span names: `publish {destination}` or `process {destination}`
+- `messaging.system` -- `rabbitmq`
+- `messaging.operation.name` -- `publish` or `process`
+- `messaging.operation.type` -- `send` or `process`
+- `messaging.destination.name` -- `exchange:routing_key` for publishing;
+  `exchange:routing_key:queue` for managed consumers. Empty components are omitted,
+  and equal routing keys and queue names are included only once. Publishing with
+  an empty exchange and routing key uses `amq.default`.
+- `messaging.rabbitmq.destination.routing_key` -- when nonempty
+- `messaging.message.conversation_id` and `messaging.message.id` -- when present
+- `messaging.rabbitmq.message.delivery_tag` -- integer, consumer only
+- `error.type` and error span status on failures. Publish failures use the canonical
+  Rust error type (`amqprs::error::Error` or `streameroo::amqp::connection::ConnectionError`).
+  Consumer failures use `decode_error`, `handler_error`, `result_error`, or `settlement_error`.
+
+The public span helpers omit the queue component because `DeliveryContext` and
+message properties do not contain the queue name.
 
 ### Configuration
 
