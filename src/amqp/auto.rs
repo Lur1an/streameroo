@@ -1,4 +1,5 @@
 use super::{AMQPDecode, Error};
+use amqprs::{FieldValue, ShortStr};
 use serde::de::DeserializeOwned;
 use std::ops::{Deref, DerefMut};
 
@@ -25,12 +26,27 @@ where
     T: DeserializeOwned,
 {
     fn decode(payload: Vec<u8>, context: &super::DeliveryContext) -> Result<Self, Error> {
-        let Some(content_type) = context.properties.content_type() else {
+        let content_type = context
+            .properties
+            .content_type()
+            .map(String::as_str)
+            .or_else(|| {
+                // Debezium forwards content type into amqp property headers. Use this as a fallback
+                // for auto decoder
+                context.properties.headers().and_then(|h| {
+                    h.get(
+                        &ShortStr::try_from("content_type")
+                            .expect("content_type is a valid ShortStr"),
+                    )
+                    .and_then(|v| TryInto::<&str>::try_into(v).ok())
+                })
+            });
+        let Some(content_type) = content_type else {
             return Err(Error::Event(
                 "Content-Type header missing for Auto decode event".into(),
             ));
         };
-        match content_type.as_str() {
+        match content_type {
             "application/json" | "json" => {
                 let event = serde_json::from_slice(&payload).map_err(Error::event)?;
                 Ok(Self(event))
