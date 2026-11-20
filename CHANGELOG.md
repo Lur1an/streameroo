@@ -26,6 +26,12 @@ Entries follow development/release order, including the historical `0.1.77`,
   struct update syntax.
 - Remove the public `consume_with_options`; use `consume` with a `ConsumerConfig`.
 
+### Features
+
+- Add `DeliveryContext::delivery_count` and `DeliveryContext::acquired_count`,
+  reading the quorum queue `x-delivery-count` and `x-acquired-count` headers.
+  Both return `None` when the header is absent.
+
 ## [0.7.0]
 
 ### Breaking changes
