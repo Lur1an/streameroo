@@ -9,6 +9,7 @@ description = "Compilation of mini-frameworks & utilities for data-streaming app
 
 [dependencies]
 thiserror = "2.0.3"
+anyhow = { version = "1.0.91", optional = true }
 tracing = "0.1.41"
 
 # Codec dependencies (transport-agnostic)
@@ -37,12 +38,13 @@ test-context = { version = "0.3.0", optional = true }
 panic = "abort"
 
 [features]
-default = ["amqp", "json"]
+default = ["amqp", "json", "anyhow"]
 amqp = ["dep:amqprs", "dep:uuid", "dep:tokio", "dep:tokio-stream"]
 msgpack = ["serde", "rmp-serde"]
 json = ["serde", "serde_json"]
 bson = ["dep:bson"]
 bytes = ["dep:bytes"]
+anyhow = ["dep:anyhow"]
 amqp-test = ["amqp", "dep:testcontainers-modules", "dep:test-context"]
 telemetry = [
     "amqp",

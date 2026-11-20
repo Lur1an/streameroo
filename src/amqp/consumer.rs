@@ -1,13 +1,12 @@
 use super::Handler;
 use super::connection::AMQPConnection;
-use super::handler::AMQPDecode;
+use super::handler::{AMQPDecode, HandlerError};
 use crate::amqp::AMQPResult;
 use crate::amqp::context::create_delivery_context;
 use amqprs::channel::{
     BasicAckArguments, BasicConsumeArguments, BasicNackArguments, BasicQosArguments,
     ConsumerMessage,
 };
-use std::fmt::Display;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -40,17 +39,15 @@ impl<H> Consumer<H> {
     }
 
     /// Handles a single delivery by spawning a task to process it
-    fn handle_delivery<E, R, Err>(
+    fn handle_delivery<E>(
         &self,
         delivery: ConsumerMessage,
         channel: &amqprs::channel::Channel,
         skip_ack: bool,
         tasks: &mut JoinSet<()>,
     ) where
-        H: Handler<E, R, Err>,
+        H: Handler<E>,
         E: AMQPDecode + Send,
-        R: AMQPResult,
-        Err: Display + Send,
     {
         let (ctx, payload) = create_delivery_context(delivery, channel);
         let handler = self.handler.clone();
@@ -83,17 +80,18 @@ impl<H> Consumer<H> {
                 }
             };
 
-            // Handler error → nack WITH requeue
+            // Handler error → nack, requeue decided by the error
             let result = match handler.handle(&ctx, event).await {
                 Ok(result) => result,
                 Err(e) => {
                     #[cfg(feature = "telemetry")]
                     super::telemetry::record_error(&tracing::Span::current(), "handler_error");
-                    tracing::error!(%e, "Handler error, nacking with requeue");
+                    let requeue = e.requeue();
+                    tracing::error!(%e, requeue, "Handler error, nacking delivery");
                     let nack_args = BasicNackArguments {
                         delivery_tag: ctx.delivery_tag,
                         multiple: false,
-                        requeue: true,
+                        requeue,
                     };
                     if let Err(e) = ctx.channel.basic_nack(nack_args).await {
                         tracing::error!(?e, "Error nacking delivery");
@@ -146,18 +144,16 @@ impl<H> Consumer<H> {
     /// Consumes the consumer and starts the loop.
     /// The loop will run indefinitely, relying on `AMQPConnection` to restore the connection
     /// if it is closed, until the notifier is triggered.
-    pub async fn consume<E, R, Err>(self)
+    pub async fn consume<E>(self)
     where
-        H: Handler<E, R, Err>,
+        H: Handler<E>,
         E: AMQPDecode + Send,
-        R: AMQPResult,
-        Err: Display + Send,
     {
         let notified = self.notifier.notified();
         tokio::pin!(notified);
 
         let mut tasks = JoinSet::new();
-        let skip_ack = R::manual() || self.consume_args.no_ack;
+        let skip_ack = self.consume_args.no_ack;
         let mut channel;
         'outer: loop {
             tracing::info!("Creating channel for consumer");
@@ -189,7 +185,7 @@ impl<H> Consumer<H> {
                     },
                     delivery = consumer_rx.recv() => {
                         if let Some(delivery) = delivery {
-                            self.handle_delivery::<E, R, Err>(delivery, &channel, skip_ack, &mut tasks);
+                            self.handle_delivery::<E>(delivery, &channel, skip_ack, &mut tasks);
                         } else {
                             tracing::warn!("Consumer closed unexpectedly");
                             break

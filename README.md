@@ -6,12 +6,12 @@ Built on top of [`amqprs`](https://github.com/gftea/amqprs) and [`tokio`](https:
 
 ## Features
 
-- **Typed handlers** -- implement `Handler<E, R, Err>` on your own structs, including multiple event types per struct
+- **Typed handlers** -- implement `Handler<E>` on your own structs, including multiple event types per struct
 - **Automatic connection recovery** -- background IO loop with reconnection and a pre-allocated channel pool for publishing
 - **Consumer resilience** -- consumers automatically recover from channel/connection failures
 - **Flexible serialization** -- JSON, MessagePack, BSON, raw bytes, or runtime content-type dispatch via `Auto<T>`
 - **Explicit state and metadata** -- store dependencies in your handler and access message metadata through `DeliveryContext`
-- **Result-driven actions** -- handler return types control ack/nack, publish, or RPC reply behavior
+- **Result-driven actions** -- handler return types control publish or RPC reply behavior, error types control requeueing
 - **Distributed tracing** -- optional OpenTelemetry trace propagation through AMQP headers
 - **Graceful shutdown** -- signal-based shutdown that drains in-flight deliveries
 - **RPC support** -- built-in [Direct Reply-To](https://www.rabbitmq.com/docs/direct-reply-to) pattern
@@ -29,7 +29,7 @@ serde = { version = "1", features = ["derive"] }
 anyhow = "1"
 ```
 
-The default features are `amqp` and `json` (serde_json). See [Feature Flags](#feature-flags) for additional options.
+The default features are `amqp`, `json` (serde_json), and `anyhow`. See [Feature Flags](#feature-flags) for additional options.
 
 ### Define an event
 
@@ -48,13 +48,16 @@ struct MyEvent {
 
 ### Write a handler
 
-A handler is a cloneable struct implementing `Handler<E, R, Err>`. Store shared dependencies in its fields, using `Arc` or cloneable handles as appropriate:
+A handler is a cloneable struct implementing `Handler<E>`. Store shared dependencies in its fields, using `Arc` or cloneable handles as appropriate:
 
 ```rust
 #[derive(Clone)]
 struct MyHandler;
 
-impl Handler<Json<MyEvent>, (), anyhow::Error> for MyHandler {
+impl Handler<Json<MyEvent>> for MyHandler {
+    type Output = ();
+    type Error = anyhow::Error;
+
     async fn handle(
         &self,
         ctx: &DeliveryContext,
@@ -68,7 +71,7 @@ impl Handler<Json<MyEvent>, (), anyhow::Error> for MyHandler {
 
 - `ctx` -- delivery metadata and the receiving AMQP channel
 - `event` -- the decoded message body, which must implement `AMQPDecode`
-- Returning `Ok(())` acknowledges the delivery; returning `Err` nacks with requeue
+- Returning `Ok(())` acknowledges the delivery; returning `Err` nacks it, requeueing unless `HandlerError::requeue` returns `false`
 
 ### Run the application
 
@@ -98,16 +101,16 @@ Combine the three Rust snippets above into `src/main.rs` and run against RabbitM
 
 ## Handlers
 
-### `Handler<E, R, Err>`
+### `Handler<E>`
 
-Implement `handle(&self, ctx: &DeliveryContext, event: E)` to return a `Send` future yielding `Result<R, Err>`.
+Set the `Output` and `Error` associated types and implement `handle(&self, ctx: &DeliveryContext, event: E)` to return a `Send` future yielding `Result<Self::Output, Self::Error>`.
 
 **Constraints:**
 - The handler must be `Clone + Send + 'static`; it is cloned for each delivery.
 - `E: AMQPDecode + Send` is the event type.
-- `R: AMQPResult` controls the successful delivery's result action.
-- `Err: Display + Send` is the handler error type (for example, `anyhow::Error` or `Infallible`).
-- Registering a consumer additionally requires `E`, `R`, and `Err` to be `'static`.
+- `Output: AMQPResult + 'static` controls the successful delivery's result action.
+- `Error: HandlerError + 'static` is the handler error type (for example, `anyhow::Error` or `Infallible`).
+- Registering a consumer additionally requires `E` to be `'static`.
 
 Types implementing the transport-independent `Decode` trait automatically implement `AMQPDecode`. Implement `AMQPDecode` directly when decoding needs delivery metadata.
 
@@ -116,7 +119,10 @@ Types implementing the transport-independent `Decode` trait automatically implem
 One struct can implement `Handler` for multiple event types. For example, add a second implementation to the quickstart handler:
 
 ```rust
-impl Handler<Vec<u8>, (), anyhow::Error> for MyHandler {
+impl Handler<Vec<u8>> for MyHandler {
+    type Output = ();
+    type Error = anyhow::Error;
+
     async fn handle(&self, _: &DeliveryContext, event: Vec<u8>) -> anyhow::Result<()> {
         println!("received {} bytes", event.len());
         Ok(())
@@ -128,11 +134,11 @@ Select the implementation when registering each queue:
 
 ```rust
 let handler = MyHandler;
-app.consume::<Json<MyEvent>, _, _, _>(handler.clone(), "my-queue", 10).await?;
-app.consume::<Vec<u8>, _, _, _>(handler, "raw-queue", 10).await?;
+app.consume::<Json<MyEvent>, _>(handler.clone(), "my-queue", 10).await?;
+app.consume::<Vec<u8>, _>(handler, "raw-queue", 10).await?;
 ```
 
-The generic parameter order is `<E, R, Err, H>` for both `consume` and `consume_with_options`. With only one applicable implementation, these types are inferred.
+The generic parameter order is `<E, H>` for both `consume` and `consume_with_options`. With only one applicable implementation, these types are inferred.
 
 ### `DeliveryContext`
 
@@ -149,14 +155,13 @@ Access metadata directly through the context passed to `handle`:
 
 ### `AMQPResult`
 
-The success type `R` controls what happens after successful execution. The trait provides a `manual()` flag: when `false` (the default), the framework auto-acks on success unless the consumer has `no_ack` enabled.
+The `Output` type controls what happens after successful execution. The framework then acks the delivery unless the consumer has `no_ack` enabled.
 
 | Return Type | Behavior |
 |-------------|----------|
-| `()` | No-op. Framework auto-acks on `Ok`, nacks with requeue on `Err`. |
+| `()` | No-op, then auto-acks. |
 | `Publish<E>` | Publishes `E` to a specified exchange/routing_key, then auto-acks. |
 | `PublishReply<E>` | Publishes `E` to the `reply-to` address (RPC pattern), then auto-acks. |
-| `DeliveryAction` | Manual ack/nack control. Framework does **not** auto-ack. |
 
 #### `Publish<E>`
 
@@ -166,7 +171,10 @@ Publishes a message to another queue after handling:
 #[derive(Clone)]
 struct ForwardHandler;
 
-impl Handler<Json<MyEvent>, Publish<Json<MyEvent>>, anyhow::Error> for ForwardHandler {
+impl Handler<Json<MyEvent>> for ForwardHandler {
+    type Output = Publish<Json<MyEvent>>;
+    type Error = anyhow::Error;
+
     async fn handle(
         &self,
         _: &DeliveryContext,
@@ -187,7 +195,10 @@ Implements the RPC reply-to pattern:
 #[derive(Clone)]
 struct RpcHandler;
 
-impl Handler<Json<String>, PublishReply<Json<String>>, anyhow::Error> for RpcHandler {
+impl Handler<Json<String>> for RpcHandler {
+    type Output = PublishReply<Json<String>>;
+    type Error = anyhow::Error;
+
     async fn handle(
         &self,
         _: &DeliveryContext,
@@ -200,31 +211,6 @@ impl Handler<Json<String>, PublishReply<Json<String>>, anyhow::Error> for RpcHan
 
 If no `reply-to` property is present on the incoming message, the reply is silently discarded.
 
-#### `DeliveryAction`
-
-For fine-grained ack/nack control:
-
-```rust
-use std::convert::Infallible;
-
-#[derive(Clone)]
-struct ManualHandler;
-
-impl Handler<Json<MyEvent>, DeliveryAction, Infallible> for ManualHandler {
-    async fn handle(
-        &self,
-        _: &DeliveryContext,
-        event: Json<MyEvent>,
-    ) -> Result<DeliveryAction, Infallible> {
-        if event.hello.is_empty() {
-            Ok(DeliveryAction::Nack { requeue: false, multiple: false })
-        } else {
-            Ok(DeliveryAction::Ack { multiple: false })
-        }
-    }
-}
-```
-
 ### Error Handling
 
 The framework distinguishes error types to decide requeue behavior:
@@ -232,8 +218,28 @@ The framework distinguishes error types to decide requeue behavior:
 | Error Source | Behavior |
 |-------------|----------|
 | Decode failure (`Error::Event`) | Nack **without** requeue (would fail again) |
-| Handler error (`Err` from `handle`) | Nack **with** requeue (assumed transient) |
+| Handler error (`Err` from `handle`) | Nack, requeue decided by `HandlerError::requeue` (default `true`) |
 | Result action failure | Nack **with** requeue |
+
+#### `HandlerError`
+
+Handler error types implement `HandlerError` (`Display + Send`). Its `requeue()` method defaults to `true`; it is implemented for `Infallible` and, with the `anyhow` feature, `anyhow::Error`. Override it to drop deliveries that would fail again:
+
+```rust
+#[derive(Debug, thiserror::Error)]
+enum MyError {
+    #[error("invalid event")]
+    Invalid,
+    #[error("database unavailable")]
+    Unavailable,
+}
+
+impl HandlerError for MyError {
+    fn requeue(&self) -> bool {
+        matches!(self, MyError::Unavailable)
+    }
+}
+```
 
 ## Serialization
 
@@ -277,7 +283,10 @@ All wrapper types implement `Deref`/`DerefMut` to the inner `T` and provide `int
 #[derive(Clone)]
 struct AutoHandler;
 
-impl Handler<Auto<MyEvent>, (), anyhow::Error> for AutoHandler {
+impl Handler<Auto<MyEvent>> for AutoHandler {
+    type Output = ();
+    type Error = anyhow::Error;
+
     async fn handle(
         &self,
         _: &DeliveryContext,
@@ -475,6 +484,7 @@ let table = table_from_map(&map);
 |---------|---------|-------------|
 | `amqp` | yes | AMQP consumers, connections, and publishing, backed by Tokio |
 | `json` | yes | `Json<T>` wrapper + `serde_json::Value` support |
+| `anyhow` | yes | `HandlerError` impl for `anyhow::Error` |
 | `msgpack` | no | `MsgPack<T>` wrapper via MessagePack |
 | `bson` | no | `Bson<T>` wrapper via BSON |
 | `bytes` | no | `Decode` impl for `bytes::Bytes` |

@@ -20,7 +20,6 @@ pub use result::*;
 
 use self::consumer::Consumer;
 use amqprs::channel::{BasicConsumeArguments, BasicQosArguments};
-use std::fmt::Display;
 use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -116,21 +115,20 @@ impl Streameroo {
 
     /// Runs a consumer on the given queue with default options
     /// - acks all successful deliveries with `multiple: false`
-    /// - nacks all failed deliveries with `requeue: true` and `multiple: false`
+    /// - nacks failed deliveries with `multiple: false`, requeueing unless decoding failed or
+    ///   `HandlerError::requeue` returns `false`
     /// - Default options & fieldtable
     /// For a handler with multiple implementations, select the event with
-    /// `app.consume::<MyEvent, _, _, _>(handler, queue, consumers)`.
-    pub async fn consume<E, R, Err, H>(
+    /// `app.consume::<MyEvent, _>(handler, queue, consumers)`.
+    pub async fn consume<E, H>(
         &mut self,
         handler: H,
         queue: impl Into<String>,
         consumers: u16,
     ) -> StreamerooResult<&mut Self>
     where
-        H: Handler<E, R, Err>,
+        H: Handler<E>,
         E: AMQPDecode + Send + 'static,
-        R: AMQPResult + 'static,
-        Err: Display + Send + 'static,
     {
         let options = BasicConsumeArguments {
             queue: queue.into(),
@@ -146,17 +144,15 @@ impl Streameroo {
         Ok(self)
     }
 
-    pub async fn consume_with_options<E, R, Err, H>(
+    pub async fn consume_with_options<E, H>(
         &mut self,
         handler: H,
         options: BasicConsumeArguments,
         qos_args: BasicQosArguments,
     ) -> StreamerooResult<&mut Self>
     where
-        H: Handler<E, R, Err>,
+        H: Handler<E>,
         E: AMQPDecode + Send + 'static,
-        R: AMQPResult + 'static,
-        Err: Display + Send + 'static,
     {
         let consumer = Consumer::new(
             self.connection.clone(),
@@ -165,7 +161,7 @@ impl Streameroo {
             handler,
             self.shutdown.clone(),
         );
-        let task = tokio::spawn(consumer.consume::<E, R, Err>());
+        let task = tokio::spawn(consumer.consume::<E>());
         self.tasks.push(task);
         Ok(self)
     }
@@ -199,7 +195,10 @@ mod test {
         counter: Arc<AtomicU8>,
     }
 
-    impl Handler<Json<TestEvent>, (), anyhow::Error> for SimpleHandler {
+    impl Handler<Json<TestEvent>> for SimpleHandler {
+        type Output = ();
+        type Error = anyhow::Error;
+
         async fn handle(
             &self,
             ctx: &DeliveryContext,
@@ -257,7 +256,10 @@ mod test {
     #[derive(Clone)]
     struct ReplyToHandler;
 
-    impl Handler<Json<TestEvent>, PublishReply<Json<TestEvent>>, anyhow::Error> for ReplyToHandler {
+    impl Handler<Json<TestEvent>> for ReplyToHandler {
+        type Output = PublishReply<Json<TestEvent>>;
+        type Error = anyhow::Error;
+
         async fn handle(
             &self,
             ctx: &DeliveryContext,
@@ -298,7 +300,10 @@ mod test {
         counter: Arc<AtomicU8>,
     }
 
-    impl Handler<Json<TestEvent>, (), anyhow::Error> for DeliveryLimitHandler {
+    impl Handler<Json<TestEvent>> for DeliveryLimitHandler {
+        type Output = ();
+        type Error = anyhow::Error;
+
         async fn handle(
             &self,
             _ctx: &DeliveryContext,
@@ -346,46 +351,50 @@ mod test {
         Ok(())
     }
 
+    #[derive(Debug, thiserror::Error)]
+    #[error("requeue: {requeue}")]
+    struct RequeueError {
+        requeue: bool,
+    }
+
+    impl HandlerError for RequeueError {
+        fn requeue(&self) -> bool {
+            self.requeue
+        }
+    }
+
     #[derive(Clone)]
-    struct ManualAckHandler {
+    struct RequeueErrorHandler {
         counter: Arc<AtomicU8>,
     }
 
-    impl Handler<Json<TestEvent>, DeliveryAction, anyhow::Error> for ManualAckHandler {
+    impl Handler<Json<TestEvent>> for RequeueErrorHandler {
+        type Output = ();
+        type Error = RequeueError;
+
         async fn handle(
             &self,
             _ctx: &DeliveryContext,
             event: Json<TestEvent>,
-        ) -> anyhow::Result<DeliveryAction> {
-            let count = self.counter.load(Ordering::Relaxed);
+        ) -> Result<(), RequeueError> {
+            let count = self.counter.fetch_add(1, Ordering::Relaxed);
             let event = event.into_inner();
             assert_eq!(event.0, "hello");
             tracing::info!(?count);
-            if count < 5 {
-                self.counter.fetch_add(1, Ordering::Relaxed);
-                Ok(DeliveryAction::Nack {
-                    requeue: true,
-                    multiple: false,
-                })
-            } else {
-                Ok(DeliveryAction::Nack {
-                    multiple: false,
-                    requeue: false,
-                })
-            }
+            Err(RequeueError { requeue: count < 4 })
         }
     }
 
     #[test_context(AMQPTest)]
     #[tokio::test]
-    async fn test_manual_ack_handler(ctx: &mut AMQPTest) -> anyhow::Result<()> {
+    async fn test_handler_error_requeue(ctx: &mut AMQPTest) -> anyhow::Result<()> {
         let queue = Uuid::new_v4().to_string();
         let channel = ctx.connection.open_channel().await?;
         channel
             .queue_declare(QueueDeclareArguments::new(&queue))
             .await?;
         let counter = Arc::new(AtomicU8::new(0));
-        let handler = ManualAckHandler {
+        let handler = RequeueErrorHandler {
             counter: counter.clone(),
         };
 
@@ -404,6 +413,9 @@ mod test {
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
+        // The fifth error is not requeued, so the delivery must not come back.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(counter.load(Ordering::Relaxed), 5);
         Ok(())
     }
 
@@ -412,7 +424,10 @@ mod test {
         counter: Arc<AtomicU8>,
     }
 
-    impl Handler<Json<TestEvent>, (), anyhow::Error> for GracefulShutdownHandler {
+    impl Handler<Json<TestEvent>> for GracefulShutdownHandler {
+        type Output = ();
+        type Error = anyhow::Error;
+
         async fn handle(
             &self,
             _ctx: &DeliveryContext,
@@ -468,7 +483,10 @@ mod test {
         success: Arc<AtomicBool>,
     }
 
-    impl Handler<Json<TestEvent>, (), anyhow::Error> for AllExtractorsHandler {
+    impl Handler<Json<TestEvent>> for AllExtractorsHandler {
+        type Output = ();
+        type Error = anyhow::Error;
+
         async fn handle(
             &self,
             ctx: &DeliveryContext,
@@ -529,7 +547,10 @@ mod test {
     #[derive(Clone)]
     struct PublishForwardHandler;
 
-    impl Handler<Json<TestEvent>, Publish<Json<TestEvent>>, anyhow::Error> for PublishForwardHandler {
+    impl Handler<Json<TestEvent>> for PublishForwardHandler {
+        type Output = Publish<Json<TestEvent>>;
+        type Error = anyhow::Error;
+
         async fn handle(
             &self,
             _ctx: &DeliveryContext,
@@ -578,7 +599,10 @@ mod test {
         invoked: Arc<AtomicBool>,
     }
 
-    impl Handler<Json<TestEvent>, (), Infallible> for DecodeErrorHandler {
+    impl Handler<Json<TestEvent>> for DecodeErrorHandler {
+        type Output = ();
+        type Error = Infallible;
+
         async fn handle(
             &self,
             _ctx: &DeliveryContext,
@@ -641,7 +665,10 @@ mod test {
         counter: Arc<AtomicU8>,
     }
 
-    impl Handler<Json<TestEvent>, (), anyhow::Error> for ReconnectHandler {
+    impl Handler<Json<TestEvent>> for ReconnectHandler {
+        type Output = ();
+        type Error = anyhow::Error;
+
         async fn handle(
             &self,
             _ctx: &DeliveryContext,

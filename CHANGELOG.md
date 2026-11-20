@@ -8,7 +8,20 @@ to crates.io; their dates identify the version-bump commits, not releases.
 Entries follow development/release order, including the historical `0.1.77`,
 `0.1.771`, and `0.2.11` version numbers.
 
-## [0.7.0] — Unreleased
+## [Unreleased]
+
+### Breaking changes
+
+- Move `Handler`'s result and error types into associated `Output` and `Error`
+  types: implement `Handler<E>` and register with `app.consume::<MyEvent, _>(...)`.
+- Handler errors must implement the new `HandlerError` trait, whose `requeue()`
+  (default `true`) decides whether a failed delivery is nacked with requeue.
+  Implemented for `Infallible` and, behind the default `anyhow` feature,
+  `anyhow::Error`.
+- Remove `DeliveryAction` and `AMQPResult::manual`; return an error with
+  `requeue() == false` to drop a delivery instead.
+
+## [0.7.0]
 
 ### Breaking changes
 

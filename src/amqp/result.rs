@@ -1,11 +1,10 @@
-use amqprs::channel::{BasicAckArguments, BasicNackArguments, BasicPublishArguments};
-use amqprs::BasicProperties;
-use std::future::Future;
-
+use super::{ChannelExt, Error};
 use crate::amqp::context::DeliveryContext;
 use crate::event::Encode;
-
-use super::{ChannelExt, Error};
+use amqprs::BasicProperties;
+use amqprs::channel::BasicPublishArguments;
+use std::future::Future;
+use tracing::warn;
 
 pub struct Publish<E> {
     pub payload: E,
@@ -30,49 +29,10 @@ impl<E> Publish<E> {
 }
 
 pub trait AMQPResult: Send {
-    /// Indicates if this result's `handle_result` implementation takes care of acking/nacking the
-    /// delivery.
-    fn manual() -> bool {
-        false
-    }
-
     fn handle_result(
         self,
         context: &DeliveryContext,
     ) -> impl Future<Output = Result<(), Error>> + Send;
-}
-
-/// Return this type from your handler to have fine-grained control over what happens to the
-/// delivery after the handler has finished.
-pub enum DeliveryAction {
-    Ack { multiple: bool },
-    Nack { requeue: bool, multiple: bool },
-}
-
-impl AMQPResult for DeliveryAction {
-    fn manual() -> bool {
-        true
-    }
-    async fn handle_result(self, context: &DeliveryContext) -> Result<(), Error> {
-        match self {
-            DeliveryAction::Ack { multiple } => {
-                let args = BasicAckArguments {
-                    delivery_tag: context.delivery_tag,
-                    multiple,
-                };
-                context.channel.basic_ack(args).await?
-            }
-            DeliveryAction::Nack { requeue, multiple } => {
-                let args = BasicNackArguments {
-                    delivery_tag: context.delivery_tag,
-                    multiple,
-                    requeue,
-                };
-                context.channel.basic_nack(args).await?
-            }
-        };
-        Ok(())
-    }
 }
 
 impl AMQPResult for () {
@@ -113,6 +73,8 @@ where
                 .channel
                 .publish("", reply_to.as_str(), self.0)
                 .await?;
+        } else {
+            warn!("No reply_to queue found for PublishReply");
         }
         Ok(())
     }
