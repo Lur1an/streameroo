@@ -8,7 +8,7 @@ to crates.io; their dates identify the version-bump commits, not releases.
 Entries follow development/release order, including the historical `0.1.77`,
 `0.1.771`, and `0.2.11` version numbers.
 
-## [Unreleased]
+## [0.8.0]
 
 ### Breaking changes
 
