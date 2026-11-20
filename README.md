@@ -90,14 +90,21 @@ async fn main() -> anyhow::Result<()> {
 
     let mut app = Streameroo::new(connection, "my-consumer");
     app.with_graceful_shutdown(tokio::signal::ctrl_c());
-    app.consume(MyHandler, "my-queue", 10).await?;
+    app.consume(
+        MyHandler,
+        ConsumerConfig {
+            prefetch_count: 10,
+            ..ConsumerConfig::new("my-queue")
+        },
+    )
+    .await?;
     app.join().await;
 
     Ok(())
 }
 ```
 
-Combine the three Rust snippets above into `src/main.rs` and run against RabbitMQ on localhost. The third argument to `consume` sets the AMQP prefetch count. Each delivery gets its own task; there is no separate worker pool or task limit. A prefetch count of zero means unlimited. For full control over QoS and consume options, use `consume_with_options`.
+Combine the three Rust snippets above into `src/main.rs` and run against RabbitMQ on localhost. `ConsumerConfig` holds the queue name plus all consume and QoS options (it is `Deserialize`, so it can be loaded from your app config). Each delivery gets its own task; there is no separate worker pool or task limit. A prefetch count of zero (the default) means unlimited.
 
 ## Handlers
 
@@ -134,11 +141,11 @@ Select the implementation when registering each queue:
 
 ```rust
 let handler = MyHandler;
-app.consume::<Json<MyEvent>, _>(handler.clone(), "my-queue", 10).await?;
-app.consume::<Vec<u8>, _>(handler, "raw-queue", 10).await?;
+app.consume::<Json<MyEvent>, _>(handler.clone(), ConsumerConfig::new("my-queue")).await?;
+app.consume::<Vec<u8>, _>(handler, ConsumerConfig::new("raw-queue")).await?;
 ```
 
-The generic parameter order is `<E, H>` for both `consume` and `consume_with_options`. With only one applicable implementation, these types are inferred.
+The generic parameter order for `consume` is `<E, H>`. With only one applicable implementation, these types are inferred.
 
 ### `DeliveryContext`
 

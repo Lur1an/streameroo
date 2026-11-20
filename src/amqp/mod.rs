@@ -9,6 +9,7 @@ mod result;
 #[cfg(feature = "telemetry")]
 pub mod telemetry;
 
+pub use self::consumer::ConsumerConfig;
 pub use amqprs;
 pub use auto::*;
 pub use channel::*;
@@ -113,38 +114,27 @@ impl Streameroo {
         }
     }
 
-    /// Runs a consumer on the given queue with default options
+    /// Runs a consumer configured by `config`
     /// - acks all successful deliveries with `multiple: false`
     /// - nacks failed deliveries with `multiple: false`, requeueing unless decoding failed or
     ///   `HandlerError::requeue` returns `false`
-    /// - Default options & fieldtable
     /// For a handler with multiple implementations, select the event with
-    /// `app.consume::<MyEvent, _>(handler, queue, consumers)`.
+    /// `app.consume::<MyEvent, _>(handler, config)`.
     pub async fn consume<E, H>(
         &mut self,
         handler: H,
-        queue: impl Into<String>,
-        consumers: u16,
+        config: ConsumerConfig,
     ) -> StreamerooResult<&mut Self>
     where
         H: Handler<E>,
         E: AMQPDecode + Send + 'static,
     {
-        let options = BasicConsumeArguments {
-            queue: queue.into(),
-            consumer_tag: self.consumer_tag.clone(),
-            ..Default::default()
-        };
-        let qos_args = BasicQosArguments {
-            prefetch_count: consumers,
-            ..Default::default()
-        };
-        self.consume_with_options(handler, options, qos_args)
-            .await?;
+        let (options, qos_args) = config.into_amqp(self.consumer_tag.clone());
+        self.consume_inner(handler, options, qos_args).await?;
         Ok(self)
     }
 
-    pub async fn consume_with_options<E, H>(
+    pub(crate) async fn consume_inner<E, H>(
         &mut self,
         handler: H,
         options: BasicConsumeArguments,
@@ -239,7 +229,14 @@ mod test {
         ctx.connection
             .publish("", &queue, Json(TestEvent("hello".into())))
             .await?;
-        app.consume(handler, &queue, 3).await?;
+        app.consume(
+            handler,
+            ConsumerConfig {
+                prefetch_count: 3,
+                ..ConsumerConfig::new(&queue)
+            },
+        )
+        .await?;
         let t = Instant::now();
         loop {
             if counter.load(Ordering::Relaxed) == 3 {
@@ -281,7 +278,14 @@ mod test {
             .queue_declare(QueueDeclareArguments::new(&queue))
             .await?;
         let mut app = Streameroo::new(ctx.connection.clone(), "test-consumer");
-        app.consume(ReplyToHandler, &queue, 1).await?;
+        app.consume(
+            ReplyToHandler,
+            ConsumerConfig {
+                prefetch_count: 1,
+                ..ConsumerConfig::new(&queue)
+            },
+        )
+        .await?;
         let mut channel = ctx.connection.open_channel().await?;
         let result: Json<TestEvent> = channel
             .direct_rpc(
@@ -345,7 +349,14 @@ mod test {
         };
 
         let mut app = Streameroo::new(ctx.connection.clone(), "test-consumer");
-        app.consume(handler, &queue, 1).await?;
+        app.consume(
+            handler,
+            ConsumerConfig {
+                prefetch_count: 1,
+                ..ConsumerConfig::new(&queue)
+            },
+        )
+        .await?;
         tokio::time::sleep(Duration::from_secs(2)).await;
         assert_eq!(counter.load(Ordering::Relaxed), 6);
         Ok(())
@@ -399,7 +410,14 @@ mod test {
         };
 
         let mut app = Streameroo::new(ctx.connection.clone(), "test-consumer");
-        app.consume(handler, &queue, 1).await?;
+        app.consume(
+            handler,
+            ConsumerConfig {
+                prefetch_count: 1,
+                ..ConsumerConfig::new(&queue)
+            },
+        )
+        .await?;
         ctx.connection
             .publish("", &queue, Json(TestEvent("hello".into())))
             .await?;
@@ -454,7 +472,14 @@ mod test {
         };
 
         let mut app = Streameroo::new(ctx.connection.clone(), "test-consumer");
-        app.consume(handler, &queue, 1).await?;
+        app.consume(
+            handler,
+            ConsumerConfig {
+                prefetch_count: 1,
+                ..ConsumerConfig::new(&queue)
+            },
+        )
+        .await?;
         let join = tokio::spawn(async move {
             app.with_graceful_shutdown(tokio::signal::ctrl_c())
                 .join()
@@ -529,7 +554,14 @@ mod test {
             success: success.clone(),
         };
         let mut app = Streameroo::new(ctx.connection.clone(), "test-consumer");
-        app.consume(handler, &queue, 1).await?;
+        app.consume(
+            handler,
+            ConsumerConfig {
+                prefetch_count: 1,
+                ..ConsumerConfig::new(&queue)
+            },
+        )
+        .await?;
 
         // Publish message to the exchange with specific routing key
         channel
@@ -581,8 +613,14 @@ mod test {
             .await?;
 
         let mut app = Streameroo::new(ctx.connection.clone(), "test-consumer");
-        app.consume(PublishForwardHandler, &initial_queue, 1)
-            .await?;
+        app.consume(
+            PublishForwardHandler,
+            ConsumerConfig {
+                prefetch_count: 1,
+                ..ConsumerConfig::new(&initial_queue)
+            },
+        )
+        .await?;
 
         ctx.connection
             .publish("", &initial_queue, Json(TestEvent("initial".into())))
@@ -630,7 +668,14 @@ mod test {
         };
 
         let mut app = Streameroo::new(ctx.connection.clone(), "test-consumer");
-        app.consume(handler, &queue, 1).await?;
+        app.consume(
+            handler,
+            ConsumerConfig {
+                prefetch_count: 1,
+                ..ConsumerConfig::new(&queue)
+            },
+        )
+        .await?;
 
         // Publish invalid payload — raw bytes that are not valid JSON
         ctx.connection
@@ -699,7 +744,14 @@ mod test {
         };
 
         let mut app = Streameroo::new(connection.clone(), "test-consumer");
-        app.consume(handler, &queue, 1).await?;
+        app.consume(
+            handler,
+            ConsumerConfig {
+                prefetch_count: 1,
+                ..ConsumerConfig::new(&queue)
+            },
+        )
+        .await?;
 
         // Publish first message
         connection

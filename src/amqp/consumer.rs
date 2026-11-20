@@ -3,15 +3,83 @@ use super::connection::AMQPConnection;
 use super::handler::{AMQPDecode, HandlerError};
 use crate::amqp::AMQPResult;
 use crate::amqp::context::create_delivery_context;
+use amqprs::FieldTable;
 use amqprs::channel::{
     BasicAckArguments, BasicConsumeArguments, BasicNackArguments, BasicQosArguments,
     ConsumerMessage,
 };
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
 use tracing::Instrument;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsumerConfig {
+    /// Target queue name. Must be provided.
+    pub queue: String,
+    /// Ignored by modern RabbitMQ releases. Default: `false`.
+    #[serde(default)]
+    pub no_local: bool,
+    /// Should automatic acknowledgements be used? Default: `false`.
+    #[serde(default)]
+    pub no_ack: bool,
+    /// Should this consumer be exclusive (the only one allowed on the target queue)? Default: `false`.
+    #[serde(default)]
+    pub exclusive: bool,
+    /// Default: `false`.
+    #[serde(default)]
+    pub no_wait: bool,
+    /// Default: empty table.
+    #[serde(default)]
+    pub arguments: FieldTable,
+    /// Default: 0.
+    #[serde(default)]
+    pub prefetch_size: u32,
+    /// Default: 0.
+    #[serde(default)]
+    pub prefetch_count: u16,
+}
+
+impl ConsumerConfig {
+    /// Turns this configuration into the AMQP types required by `amqprs` functions.
+    /// `consumer_tag` is left out of the config type as it is part of the `Streameroo` runner
+    /// struct
+    pub(crate) fn into_amqp(
+        self,
+        consumer_tag: String,
+    ) -> (BasicConsumeArguments, BasicQosArguments) {
+        let consume_args = BasicConsumeArguments {
+            queue: self.queue,
+            consumer_tag,
+            no_local: self.no_local,
+            no_ack: self.no_ack,
+            exclusive: self.exclusive,
+            no_wait: self.no_wait,
+            arguments: self.arguments,
+        };
+        let qos_args = BasicQosArguments {
+            prefetch_size: self.prefetch_size,
+            prefetch_count: self.prefetch_count,
+            global: false,
+        };
+        (consume_args, qos_args)
+    }
+
+    pub fn new(queue: impl Into<String>) -> Self {
+        Self {
+            queue: queue.into(),
+            no_local: false,
+            no_ack: false,
+            exclusive: false,
+            no_wait: false,
+            arguments: FieldTable::default(),
+            prefetch_size: 0,
+            prefetch_count: 0,
+        }
+    }
+}
 
 pub struct Consumer<H> {
     connection: AMQPConnection,

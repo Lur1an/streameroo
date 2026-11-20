@@ -20,6 +20,11 @@ Entries follow development/release order, including the historical `0.1.77`,
   `anyhow::Error`.
 - Remove `DeliveryAction` and `AMQPResult::manual`; return an error with
   `requeue() == false` to drop a delivery instead.
+- `consume` now takes a `ConsumerConfig` (queue, consume options, prefetch
+  size/count) instead of a queue name and prefetch count. `ConsumerConfig` is
+  `Serialize`/`Deserialize`; build one with `ConsumerConfig::new(queue)` and
+  struct update syntax.
+- Remove the public `consume_with_options`; use `consume` with a `ConsumerConfig`.
 
 ## [0.7.0]
 
